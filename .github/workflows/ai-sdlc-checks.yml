@@ -1,0 +1,85 @@
+# The loader gates its own PRs (ai-sdlc #731 slice 1). This caller on main runs the loader's
+# checks.yml from main; the broker accepts that one call only from this repo, because main takes
+# only reviewed PRs. The jobs read the PR as data and never run its code, which is why
+# pull_request_target is safe. This repo is public, so the jobs run on GitHub-hosted runners.
+name: AI-SDLC checks
+
+on:
+  # No ready_for_review: checks.yml does nothing different for drafts, so marking a PR ready would
+  # only start a second run for the same head and cancel the first (#610).
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created, edited, deleted]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  statuses: write
+  id-token: write
+
+# One group per workflow, event, PR and review/other kind. Ordinary comments cannot
+# cancel review runs; newer reviews replace older ones. PR events stay in their own
+# event-named 'other' group. The review expression must stay in sync with comment-filter's if:.
+# Plain-issue comments use issue.number, which cannot be a different PR's number.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{ github.event_name == 'issue_comment' && github.event.issue.pull_request && (contains(github.event.comment.body, 'VERDICT:') || contains(github.event.comment.body, '**Verdict:**') || contains(github.event.comment.body, 'Reviewed head:') || contains(github.event.changes.body.from, 'VERDICT:') || contains(github.event.changes.body.from, '**Verdict:**') || contains(github.event.changes.body.from, 'Reviewed head:')) && (github.event.comment.author_association == 'OWNER' || github.event.comment.author_association == 'MEMBER' || github.event.comment.author_association == 'COLLABORATOR' || ((github.event.comment.author_association == 'CONTRIBUTOR' || github.event.comment.author_association == 'NONE') && !endsWith(github.event.comment.user.login, '[bot]'))) && 'review' || 'other' }}
+  cancel-in-progress: true
+
+jobs:
+  # PR events skip this comment-only runner allocation and enter the full checks below.
+  # The job if: decides without a runner, so ordinary comments (no review marker, or an author
+  # review_on_head.sh ignores) queue nothing. The step repeats the check as a second line of defence.
+  # Marker match is a conservative prefilter; review_on_head.sh stays the trusted parser. The body
+  # is read from env, never interpolated into the script.
+  # Authors are counted as review_on_head.sh counts them (author_association; [bot] logins never count for CONTRIBUTOR/NONE).
+  comment-filter:
+    if: >-
+      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      (contains(github.event.comment.body, 'VERDICT:') ||
+      contains(github.event.comment.body, '**Verdict:**') ||
+      contains(github.event.comment.body, 'Reviewed head:') ||
+      contains(github.event.changes.body.from, 'VERDICT:') ||
+      contains(github.event.changes.body.from, '**Verdict:**') ||
+      contains(github.event.changes.body.from, 'Reviewed head:')) &&
+      (github.event.comment.author_association == 'OWNER' ||
+      github.event.comment.author_association == 'MEMBER' ||
+      github.event.comment.author_association == 'COLLABORATOR' ||
+      ((github.event.comment.author_association == 'CONTRIBUTOR' ||
+      github.event.comment.author_association == 'NONE') &&
+      !endsWith(github.event.comment.user.login, '[bot]')))
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.f.outputs.run }}
+    steps:
+      - id: f
+        env:
+          IS_PR: ${{ github.event.issue.pull_request != null }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          ASSOC: ${{ github.event.comment.author_association }}
+          BODY: ${{ github.event.comment.body }}
+          FROM: ${{ github.event.changes.body.from }}
+        run: |
+          run=false
+          case "$ASSOC" in
+            OWNER|MEMBER|COLLABORATOR) counted=true ;;
+            CONTRIBUTOR|NONE) case "$AUTHOR" in *\[bot\]) counted=false ;; *) counted=true ;; esac ;;
+            *) counted=false ;;
+          esac
+          # Here-string, not a pipe: under bash -eo pipefail a body over ~64 KB makes printf die of SIGPIPE when grep -q exits early.
+          if [ "$IS_PR" = true ] && [ "$counted" = true ] && grep -qiE 'VERDICT:|\*\*Verdict:\*\*|Reviewed head:' <<<"$BODY"$'\n'"$FROM"; then run=true; fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: comment-filter
+    # A status function permits the deliberately skipped PR dependency, without reviving cancellation.
+    # A comment needs a successful filter and its explicit pass output; errors always hold.
+    if: >-
+      ${{ !cancelled() && ((github.event_name == 'pull_request_target' &&
+      needs.comment-filter.result == 'skipped') || (github.event_name == 'issue_comment' &&
+      needs.comment-filter.result == 'success' && needs.comment-filter.outputs.run == 'true')) }}
+    # timeout-minutes: set on each job of the called workflow; GitHub rejects it on a caller job.
+    uses: eugnel-ltd/ai-sdlc-loader/.github/workflows/checks.yml@main
