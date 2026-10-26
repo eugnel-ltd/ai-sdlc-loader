@@ -30,6 +30,7 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 
 - Every change is a PR from a fork into `main`. No other branch can be created here.
 - `main` needs the status `ai-sdlc/review-on-head`: an independent APPROVE from a company other than every writer's, on the PR head.
-- Only GitHub Actions can move tags. Only `tag-sync.yml` has `contents: write`.
+- Only the `eugnel-ai-sdlc-gates` App can move tags. `tag-sync.yml` gets its token from the broker (`fetch_gates.py repo-token`): one hour, this repo only, `contents: write`.
+- The nightly audit gets the same kind of token for its own repo (contents, issues and pull-requests write). No workflow here takes a PAT or a caller secret.
 
 Test: `python3 -m unittest discover -v -s tests` (needs `zstd`).

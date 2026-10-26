@@ -359,3 +359,46 @@ class Pins(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepoToken(unittest.TestCase):
+    TOKEN = "ghs_" + "x" * 36
+
+    def answer(self, body):
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(body).encode()
+        response.__enter__.return_value = response
+        return response
+
+    def test_the_token_is_written_mode_600_and_never_printed(self):
+        sent = []
+
+        def urlopen(request, timeout):
+            sent.append(request)
+            return self.answer({"token": self.TOKEN, "job": "tag-sync", "repository": "eugnel-ltd/ai-sdlc-loader",
+                                "permissions": {"contents": "write"}, "expires_at": "2026-10-26T13:00:00Z"})
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(loader, "oidc_token", return_value="h.p.s"), \
+                mock.patch.object(loader.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = loader.main(["repo-token", "--out", f"{directory}/t"])
+            written = Path(f"{directory}/t")
+            self.assertEqual(code, 0)
+            self.assertEqual(written.read_text(), self.TOKEN)
+            self.assertEqual(written.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(self.TOKEN, out.getvalue())
+        self.assertIn("REPO-TOKEN OK job=tag-sync", out.getvalue())
+        self.assertEqual((sent[0].get_method(), sent[0].full_url),
+                         ("POST", "https://ai-sdlc-gates.fol2hk.workers.dev/v1/repo-token"))
+        self.assertEqual(sent[0].data, b"")
+
+    def test_a_refusal_or_an_odd_answer_writes_nothing(self):
+        refused = loader.urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b'{"error":"forbidden"}'))
+        for effect, code in ((refused, 2), (lambda *_a, **_k: self.answer({"error": "x"}), 1)):
+            with tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(loader, "oidc_token", return_value="h.p.s"), \
+                    mock.patch.object(loader.urllib.request, "urlopen", side_effect=effect), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(loader.main(["repo-token", "--out", f"{directory}/t"]), code)
+                self.assertFalse(Path(f"{directory}/t").exists())

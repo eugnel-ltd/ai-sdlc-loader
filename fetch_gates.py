@@ -6,6 +6,8 @@
   fetch_gates.py fetch  --verifier <dir> --out <dir>   the run's one broker fetch: signed record and archive
   fetch_gates.py unpack --verifier <dir> --saved <dir> --loader-sha <sha> --out <dir>
                                                       a later job: verify the saved pair again, then unpack
+  fetch_gates.py repo-token --out <file>              a one-hour App token for this repository only, with
+                                                      the job's fixed permissions (slice 5); written mode 600
 
 The broker only checks the caller's OIDC token. This script does every signature, freshness,
 digest and path check, with the pinned cosign and trusted root in <dir> (verifier/fetch_cosign.sh).
@@ -41,6 +43,7 @@ OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 LOADER_WORKFLOW = re.compile(
     r"eugnel-ltd/ai-sdlc-loader/\.github/workflows/(?:checks|security|nightly-gates)\.yml@(refs/tags/v3|refs/heads/main|[0-9a-f]{40})"
 )
+INSTALLATION_TOKEN = re.compile(r"ghs_[A-Za-z0-9_]{20,255}")
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_ARCHIVE = 100 * 1024 * 1024
@@ -288,7 +291,32 @@ def finish(record: dict[str, object], route: str, bundle: dict[str, object], bod
     return 0
 
 
+def repo_token(broker: str, out: Path) -> int:
+    # The broker decides the job and its permissions from the OIDC claims; the request asks for nothing.
+    request = urllib.request.Request(
+        f"{broker.rstrip('/')}/v1/repo-token", data=b"", method="POST",
+        headers={"Authorization": f"Bearer {oidc_token()}", "User-Agent": USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            answer = json.loads(response.read(64 * 1024))
+    except urllib.error.HTTPError as error:
+        raise OSError(f"broker repo-token failed with HTTP {error.code}") from None
+    token = answer.get("token") if isinstance(answer, dict) else None
+    if not isinstance(token, str) or not INSTALLATION_TOKEN.fullmatch(token):
+        raise Refused("broker repo-token answer holds no installation token")
+    descriptor = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(token)
+    permissions = ",".join(f"{k}:{v}" for k, v in sorted((answer.get("permissions") or {}).items()))
+    print(f"REPO-TOKEN OK job={answer.get('job')} repository={answer.get('repository')} "
+          f"permissions={permissions} expires={answer.get('expires_at')}")
+    return 0
+
+
 def run(args: argparse.Namespace) -> int:
+    if args.command == "repo-token":
+        return repo_token(args.broker, Path(args.out))
     verifier = Path(args.verifier)
     verify = lambda bundle, digest: cosign_verifies(verifier, bundle, digest)  # noqa: E731
     token = oidc_token()
@@ -325,8 +353,8 @@ def run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("bundle", "record", "fetch", "unpack"))
-    parser.add_argument("--verifier", required=True)
+    parser.add_argument("command", choices=("bundle", "record", "fetch", "unpack", "repo-token"))
+    parser.add_argument("--verifier")
     parser.add_argument("--out", required=True)
     parser.add_argument("--broker", default=BROKER)
     parser.add_argument("--saved", help="unpack: the directory that fetch wrote")
@@ -334,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "unpack" and not (args.saved and args.loader_sha):
         parser.error("unpack needs --saved and --loader-sha")
+    if args.command != "repo-token" and not args.verifier:
+        parser.error(f"{args.command} needs --verifier")
     try:
         return run(args)
     except Refused as error:

@@ -2,8 +2,9 @@
 # reads the newest signed release record through the broker with this workflow's OIDC identity,
 # verifies it offline with the pinned verifier, and moves v3 to the record's newest loader commit:
 # the last entry of `loader_shas`. During a promotion transition the list holds the old and the new
-# commit, newest last (contract E). The target must be a commit on main. Only GitHub Actions may
-# move tags here (the tag ruleset), and only this workflow has contents: write.
+# commit, newest last (contract E). The target must be a commit on main. The tag ruleset lets only
+# the eugnel-ai-sdlc-gates App move tags (owner, 26 Oct 2026); this job pushes with a one-hour App
+# token that the broker issues to this workflow alone, for this repository and contents: write only.
 name: Tag sync
 
 on:
@@ -24,12 +25,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Read the newest signed record and move v3
         shell: bash
         run: |
@@ -48,5 +50,14 @@ jobs:
             echo "TAG-SYNC OK: v3 is already at $target"
             exit 0
           fi
-          git push -f origin "$target:refs/tags/v3"
+          python3 -I fetch_gates.py repo-token --out "$RUNNER_TEMP/app-token"
+          token=$(cat "$RUNNER_TEMP/app-token"); rm -f "$RUNNER_TEMP/app-token"
+          echo "::add-mask::$token"
+          auth=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          # The header lives in this command's environment only, never in .git/config or a URL.
+          GIT_CONFIG_COUNT=2 \
+            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="" \
+            GIT_CONFIG_KEY_1=http.https://github.com/.extraheader GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $auth" \
+            git push -f origin "$target:refs/tags/v3"
           echo "TAG-SYNC MOVED: v3 ${current:-none} -> $target"
