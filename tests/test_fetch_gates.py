@@ -282,7 +282,7 @@ class ArchiveMedia(unittest.TestCase):
         for media in ("application/gzip", "application/zstd"):
             loader.bundle_object({**bundle(), "archive_media": media})
 
-    def test_an_unknown_media_is_refused_on_every_route(self):
+    def test_an_unknown_media_is_refused_on_current_pin_and_candidate(self):
         for media in ("application/x-tar", "", None, 1):
             odd = {**bundle(), "archive_media": media}
             with self.assertRaises(loader.Refused):
