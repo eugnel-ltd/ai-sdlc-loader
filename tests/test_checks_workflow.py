@@ -81,6 +81,11 @@ class SecurityAndNightly(unittest.TestCase):
                        "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b"):
             self.assertIn(digest, install)
 
+    def test_the_audit_runs_claude_on_the_runner_api_key_only(self):
+        # Owner, 26 Oct 2026: "On local you can use api". No bare claude call may use a login.
+        self.assertIn('sh "$gates/scripts/claude_api.sh" -p "$prompt"', self.NIGHTLY)
+        self.assertNotIn("\n          claude -p", self.NIGHTLY)
+
     def test_the_caller_cannot_supply_the_audit_command(self):
         # ai-sdlc #731 section 6: the nightly audit_command input is removed.
         self.assertNotIn("audit_command", self.NIGHTLY)
