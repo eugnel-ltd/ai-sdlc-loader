@@ -44,7 +44,9 @@ OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 LOADER_WORKFLOW = re.compile(
     r"eugnel-ltd/ai-sdlc-loader/\.github/workflows/(?:checks|security|nightly-gates|bot-review)\.yml@(refs/tags/v3|refs/heads/main|[0-9a-f]{40})"
 )
-INSTALLATION_TOKEN = re.compile(r"ghs_[A-Za-z0-9_]{20,255}")
+# GitHub's pattern for both installation token formats: the old 40-character one and, since
+# 2 Oct 2026, the stateless ghs_<app id>_<JWT> of about 520 characters (dots and dashes included).
+INSTALLATION_TOKEN = re.compile(r"ghs_[A-Za-z0-9.\-_]{36,4096}")
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_ARCHIVE = 100 * 1024 * 1024
