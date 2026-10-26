@@ -172,6 +172,26 @@ class Unpack(unittest.TestCase):
                 loader.unpack(archive, Path(directory) / "out")
             self.assertFalse((Path(directory) / "out").exists())
 
+    def write_tree(self, directory, files, manifest):
+        for name, data in files.items():
+            (directory / name).parent.mkdir(parents=True, exist_ok=True)
+            (directory / name).write_bytes(data)
+        (directory / "MANIFEST.sha256").write_text(manifest)
+
+    def test_manifest_lists_every_file_with_its_digest(self):
+        files = {"scripts/a.sh": b"a", "bin/linux-amd64/tool": b"b"}
+        lines = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in sorted(files.items()))
+        with tempfile.TemporaryDirectory() as directory:
+            self.write_tree(Path(directory), files, lines)
+            loader.check_manifest(Path(directory))
+        for changed in ({"scripts/a.sh": b"x", "bin/linux-amd64/tool": b"b"},
+                        {**files, "scripts/extra.sh": b"c"}):
+            with tempfile.TemporaryDirectory() as directory, self.assertRaises(loader.Refused):
+                self.write_tree(Path(directory), changed, lines)
+                loader.check_manifest(Path(directory))
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(loader.Refused):
+            loader.check_manifest(Path(directory))
+
     def test_digest_and_size_must_match(self):
         loader.check_archive(b"archive", bundle())
         with self.assertRaises(loader.Refused):
@@ -194,6 +214,7 @@ class Main(unittest.TestCase):
                 mock.patch.object(loader, "broker_get", side_effect=broker_get), \
                 mock.patch.object(loader, "cosign_verifies", return_value=True), \
                 mock.patch.object(loader, "utc_now", return_value=NOW), \
+                mock.patch.object(loader, "check_manifest"), \
                 mock.patch.object(loader, "unpack") as unpack:
             code = loader.main(["bundle", "--verifier", directory, "--out", f"{directory}/out"])
         self.assertEqual(code, 0)
@@ -238,6 +259,7 @@ class Main(unittest.TestCase):
                 mock.patch.object(loader, "broker_get", side_effect=broker_get), \
                 mock.patch.object(loader, "cosign_verifies", return_value=True), \
                 mock.patch.object(loader, "utc_now", return_value=NOW), \
+                mock.patch.object(loader, "check_manifest"), \
                 mock.patch.object(loader, "unpack") as unpack:
             with mock.patch.object(loader, "oidc_token", return_value=token(claims(LOADER))):
                 fetched = loader.main(["fetch", "--verifier", directory, "--out", f"{directory}/saved"])

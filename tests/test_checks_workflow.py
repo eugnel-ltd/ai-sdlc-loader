@@ -41,8 +41,17 @@ class ChecksWorkflow(unittest.TestCase):
         for script in ("review_on_head.sh", "owner_decisions_check.sh", "secret_scan.sh", "locked_tests_check.py"):
             self.assertIn(f'"$gates/scripts/{script}"', WORKFLOW)
             self.assertNotIn(f"$SCRIPTS/{script}", WORKFLOW)
-        self.assertEqual(WORKFLOW.count("uses: actions/download-artifact@"), 4)
-        self.assertEqual(WORKFLOW.count('sh "$loader/load_gates.sh"'), 4)
+        self.assertEqual(WORKFLOW.count("uses: actions/download-artifact@"), 6)
+        self.assertEqual(WORKFLOW.count('sh "$loader/load_gates.sh"'), 6)
+
+    def test_native_gates_run_the_archive_binaries(self):
+        # Slice 3: no gate reads the caller's copies or builds anything.
+        for tool in ("written-by", "manifest-check", "cf-cost-check"):
+            self.assertIn(f'"$bin/{tool}"', WORKFLOW)
+        self.assertNotIn("$SCRIPTS", WORKFLOW)
+        self.assertNotIn("setup-go", WORKFLOW)
+        self.assertNotIn("go build", WORKFLOW)
+        self.assertEqual(WORKFLOW.count("bin=$gates/bin/$os-$arch"), 3)
 
 
 if __name__ == "__main__":

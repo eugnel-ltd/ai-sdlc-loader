@@ -10,10 +10,10 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 
 | File | What it does |
 |---|---|
-| `.github/workflows/checks.yml` | The PR checks. The first job fetches the signed record and bundle once and keeps them as a run artifact. `review-on-head`, `owner-decisions`, `locked-tests` and `secret-scan` verify that pair again and run their scripts from the bundle. The written-by, manifest and Cloudflare-cost gates still read the caller's `.ai-sdlc/` until slice 3. |
+| `.github/workflows/checks.yml` | The PR checks. The first job fetches the signed record and bundle once and keeps them as a run artifact. `review-on-head`, `owner-decisions`, `locked-tests` and `secret-scan` verify that pair again and run their scripts from the bundle. The written-by, manifest and Cloudflare-cost gates run the archive's prebuilt binaries (`bin/<os>-<arch>/`). No gate reads the caller's `.ai-sdlc/`. |
 | `.github/workflows/tag-sync.yml` | Moves `v3` to the newest loader commit in the signed record (contract G). |
 | `.github/workflows/ai-sdlc-checks.yml` | This repo's own PR gate. It calls `checks.yml` at `main`. |
-| `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. `fetch` is the run's one broker call; `unpack` checks the saved pair again in a later job. |
+| `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. `fetch` is the run's one broker call; `unpack` checks the saved pair again in a later job, then checks every unpacked file against `MANIFEST.sha256`. |
 | `load_gates.sh` | Runs `unpack` with this loader commit's pinned verifier. |
 | `verifier/` | A byte copy of ai-sdlc `gates/verifier/` (contract C). Change both together in reviewed PRs. |
 
