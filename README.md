@@ -13,6 +13,7 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 | `.github/workflows/checks.yml` | The PR checks. The first job fetches the signed record and bundle once and keeps them as a run artifact. `review-on-head`, `owner-decisions`, `locked-tests` and `secret-scan` verify that pair again and run their scripts from the bundle. The written-by, manifest and Cloudflare-cost gates run the archive's prebuilt binaries (`bin/<os>-<arch>/`). No gate reads the caller's `.ai-sdlc/`. |
 | `.github/workflows/security.yml` | The weekly security scan. `security_intake.py` comes from the signed bundle. |
 | `.github/workflows/nightly-gates.yml` | The manual nightly lessons audit on the Mac runner. The prompt and `nightly_status.py` come from the signed bundle; the caller cannot supply the command. |
+| `.github/workflows/bot-review.yml` | The App's formal review of each open PR head, from the bundle's `bot_review.sh` (slice 5). |
 | `.github/workflows/tag-sync.yml` | Moves `v3` to the newest loader commit in the signed record (contract G). |
 | `.github/workflows/ai-sdlc-checks.yml` | This repo's own PR gate. It calls `checks.yml` at `main`. |
 | `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. `fetch` is the run's one broker call; `unpack` checks the saved pair again in a later job, then checks every unpacked file against `MANIFEST.sha256`. |

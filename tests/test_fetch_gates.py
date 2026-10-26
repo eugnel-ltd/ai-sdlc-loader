@@ -103,7 +103,7 @@ class Served(unittest.TestCase):
         self.assertEqual(route, "current")
 
     def test_every_loader_file_is_a_loader_call(self):
-        for name in ("checks", "security", "nightly-gates"):
+        for name in ("checks", "security", "nightly-gates", "bot-review"):
             call = {"job_workflow_ref": f"eugnel-ltd/ai-sdlc-loader/.github/workflows/{name}.yml@refs/tags/v3",
                     "job_workflow_sha": LOADER}
             self.assertEqual(loader.served(record(1, loader_shas=[LOADER]), call)[0], "current")
