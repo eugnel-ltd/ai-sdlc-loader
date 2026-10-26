@@ -555,4 +555,7 @@ jobs:
           if git --no-replace-objects show "$base_sha:docs/owner-decisions.md" > "$RUNNER_TEMP/owner-decisions.md" 2>/dev/null; then
             set -- --decisions "$RUNNER_TEMP/owner-decisions.md"
           fi
-          "$bin/cf-cost-check" --head "$sha" --base "$base_sha" "$@"
+          rc=0; "$bin/cf-cost-check" --head "$sha" --base "$base_sha" "$@" || rc=$?
+          # The one documented fix for every finding (ai-sdlc #731): measure, set limits, rate-limit per IP.
+          [ "$rc" -ne 1 ] || echo "::error::How to fix: https://github.com/eugnel-ltd/ai-sdlc/blob/main/references/cloudflare.md#the-one-way-to-meet-the-limits-and-the-rate-limit"
+          exit "$rc"

@@ -56,5 +56,44 @@ class ChecksWorkflow(unittest.TestCase):
         self.assertEqual(WORKFLOW.count("bin=$gates/bin/$os-$arch"), 3)
 
 
+class SecurityAndNightly(unittest.TestCase):
+    SECURITY = (ROOT / ".github/workflows/security.yml").read_text()
+    NIGHTLY = (ROOT / ".github/workflows/nightly-gates.yml").read_text()
+
+    def test_scripts_come_from_the_signed_bundle(self):
+        self.assertIn('python3 -I "$RUNNER_TEMP/ai-sdlc-gates/scripts/security_intake.py"', self.SECURITY)
+        self.assertIn('fetch_gates.py" bundle', self.SECURITY)
+        self.assertIn('"$gates/scripts/nightly_status.py"', self.NIGHTLY)
+        self.assertIn('cat "$gates/references/lessons-audit.md"', self.NIGHTLY)
+        for text in (self.SECURITY, self.NIGHTLY):
+            self.assertNotIn("$SCRIPTS", text)
+            self.assertNotIn(".caller/", text)
+
+    def test_a_public_runner_installs_without_homebrew(self):
+        # The public path is GitHub-hosted Ubuntu, which has no Homebrew: brew runs only when present,
+        # and the Linux path checks each pinned download by SHA-256.
+        self.assertIn("visibility == 'public' && fromJSON('[\"ubuntu-24.04\"]')", self.SECURITY)
+        install = self.SECURITY[self.SECURITY.index("- name: Install the scanners"):self.SECURITY.index("- name: Load the signed gate bundle")]
+        self.assertIn("if command -v brew >/dev/null; then", install)
+        self.assertEqual(install.count("brew install"), 1)
+        self.assertEqual(install.count("sha256sum -c -"), 2)
+        for digest in ("551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+                       "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b"):
+            self.assertIn(digest, install)
+
+    def test_the_caller_cannot_supply_the_audit_command(self):
+        # ai-sdlc #731 section 6: the nightly audit_command input is removed.
+        self.assertNotIn("audit_command", self.NIGHTLY)
+        self.assertEqual(self.NIGHTLY.count('fetch_gates.py" fetch '), 1)
+
+    def test_both_may_mint_an_oidc_token(self):
+        for text in (self.SECURITY, self.NIGHTLY):
+            top = text[text.index("\npermissions:\n"):text.index("\njobs:\n")]
+            self.assertIn("\n  id-token: write\n", top)
+
+    def test_cf_cost_failure_points_to_the_one_fix(self):
+        self.assertIn("references/cloudflare.md#the-one-way-to-meet-the-limits-and-the-rate-limit", WORKFLOW)
+
+
 if __name__ == "__main__":
     unittest.main()
