@@ -5,7 +5,8 @@
 # The audit prompt (references/lessons-audit.md) and nightly_status.py come from the signed gate
 # bundle; the caller's `.ai-sdlc/` is not read, and the caller cannot supply the command (#731
 # section 6). The scheduled audit runs from a Claude cloud session; this is the manual run on the
-# owner's Mac runner, whose agent CLI uses the runner's own login.
+# owner's Mac runner. claude runs through the bundle's scripts/claude_api.sh on the Anthropic API key
+# in ~/.config/eugnel-runners/anthropic-api-key, never a subscription login (owner, 26 Oct 2026).
 #
 # Auth contract (until the slice-5 App token): the caller grants contents, issues and
 # pull-requests write and passes `secrets: audit_token`, a token with those scopes on the repo.
@@ -103,7 +104,7 @@ jobs:
           # The runner's shell has errexit on, so the status is captured in a conditional; else a red
           # audit ends the step here and its log tail never reaches the run log.
           code=0
-          claude -p "$prompt" --permission-mode acceptEdits \
+          sh "$gates/scripts/claude_api.sh" -p "$prompt" --permission-mode acceptEdits \
             --allowedTools "Bash(git:*) Bash(gh:*) Bash(date:*) Bash(python3 $gates/scripts/bookmark.py:*) Read Edit Write Grep Glob" \
             > audit.log 2>&1 || code=$?
           tail -c 20000 audit.log
