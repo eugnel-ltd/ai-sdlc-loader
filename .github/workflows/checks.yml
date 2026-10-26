@@ -1,0 +1,568 @@
+# AI-SDLC checks, served by the public loader (ai-sdlc #731).
+#
+# Reusable workflow. A repo of eugnel-ltd or fol2 calls it from its thin caller
+# `.github/workflows/ai-sdlc-checks.yml` on main, with `permissions: id-token: write`:
+#   uses: eugnel-ltd/ai-sdlc-loader/.github/workflows/checks.yml@v3            (adopters, slice 6)
+#   uses: eugnel-ltd/ai-sdlc-loader/.github/workflows/checks.yml@<40-hex sha>  (the canary only)
+# The jobs, job names and the status `ai-sdlc/review-on-head` are the same as in ai-sdlc's
+# checks.yml, byte for byte (#731 section 8).
+#
+# review-on-head runs review_on_head.sh from the signed gate bundle (slice 1). Its step takes this
+# loader commit's fetch_gates.py and the pinned verifier. It gets an Actions OIDC token for the
+# broker, verifies the newest unexpired signed record and the archive digest offline, and unpacks
+# the bundle into $RUNNER_TEMP. If any check fails, it writes an `error` status and never falls
+# back to another copy. The other jobs still read the caller's `.ai-sdlc/` on its base until
+# slice 2 moves them. Each job reads the PR as data and never runs PR code, as before.
+#
+# Runner (#731 section 7): GitHub-hosted only for a public repo, else [self-hosted, linux]. The
+# caller's runs_on is accepted and ignored.
+name: AI-SDLC checks
+
+on:
+  workflow_call:
+    inputs:
+      base:
+        description: The trusted helper and policy branch (locked tests use the PR target separately)
+        type: string
+        default: main
+      scripts_dir:
+        description: Where the skill's check scripts live in this repo
+        type: string
+        default: .ai-sdlc
+      test_paths:
+        description: Pathspecs that identify test files, space-separated
+        type: string
+        default: "tests/ :(glob)**/test_*.py :(glob)**/*_test.go :(glob)**/*.test.* :(glob)**/*.spec.*"
+      runs_on:
+        description: Ignored; the loader chooses the runner from the repo's visibility
+        type: string
+        default: '["self-hosted", "linux"]'
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  statuses: write
+
+# The PR's own commits are fetched as data (refs/pull/<n>/head) and never checked out as the
+# working tree the scripts run from. The refspec forces the update ("+"): a self-hosted runner
+# keeps refs/remotes/pr/head from the last PR it checked, and a plain fetch refuses that
+# non-fast-forward update, exits 1 and, with -q, prints nothing.
+
+jobs:
+  resolve:
+    name: Resolve the PR and its head
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    timeout-minutes: 10
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      head: ${{ steps.pr.outputs.head }}
+      branch: ${{ steps.pr.outputs.branch }}
+      target_base_sha: ${{ steps.pr.outputs.target_base_sha }}
+      target_base_ref: ${{ steps.pr.outputs.target_base_ref }}
+      is_pr: ${{ steps.pr.outputs.is_pr }}
+    steps:
+      - id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          IS_ISSUE_PR: ${{ github.event.issue.pull_request != null }}
+        run: |
+          set -eu
+          command -v gh >/dev/null || { echo "::error::gh is not installed on this runner"; exit 2; }
+          resolve_error() { echo "::error::$*"; exit 2; }
+          full_sha() {
+            case "$1" in *[!0-9a-f]*|"") return 1 ;; esac
+            [ ${#1} -eq 40 ]
+          }
+          if [ "$EVENT" = pull_request ] || [ "$EVENT" = pull_request_target ]; then
+            requested=$PR_NUMBER
+          elif [ "$EVENT" = issue_comment ] && [ "$IS_ISSUE_PR" = true ]; then
+            requested=$ISSUE_NUMBER
+          else
+            echo "is_pr=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          case "$requested" in ''|*[!0-9]*) resolve_error "Invalid PR number" ;; esac
+          # One authenticated snapshot binds the head and actual target together. The
+          # configured helper branch remains independent of these product data refs.
+          snapshot=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$requested" \
+            --jq '[.number,.head.sha,.head.ref,.base.sha,.base.ref,.base.repo.full_name]|@tsv') \
+            || resolve_error "Could not resolve the current PR"
+          case "$snapshot" in *$'\n'*|*$'\r'*) resolve_error "Invalid PR metadata row" ;; esac
+          IFS=$'\t' read -r number head branch target_base_sha target_base_ref base_repo surplus <<EOF
+          $snapshot
+          EOF
+          [ "$number" = "$requested" ] && [ -z "$surplus" ] || resolve_error "PR identity mismatch"
+          full_sha "$head" && full_sha "$target_base_sha" || resolve_error "Invalid PR commit identity"
+          git check-ref-format "refs/heads/$branch" >/dev/null 2>&1 \
+            && git check-ref-format "refs/heads/$target_base_ref" >/dev/null 2>&1 \
+            || resolve_error "Invalid PR branch identity"
+          [ "$base_repo" = "$GITHUB_REPOSITORY" ] || resolve_error "PR target repository mismatch"
+          if [ "$EVENT" != issue_comment ]; then
+            [ "$head" = "$PR_HEAD" ] && [ "$branch" = "$PR_BRANCH" ] \
+              && [ "$target_base_ref" = "$PR_BASE_REF" ] && [ "$base_repo" = "$PR_BASE_REPO" ] \
+              || resolve_error "PR changed head or target since this event"
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "target_base_sha=$target_base_sha" >> "$GITHUB_OUTPUT"
+          echo "target_base_ref=$target_base_ref" >> "$GITHUB_OUTPUT"
+          echo "is_pr=true" >> "$GITHUB_OUTPUT"
+
+  review-on-head:
+    name: Independent APPROVE names the head
+    needs: resolve
+    if: needs.resolve.outputs.is_pr == 'true'
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    timeout-minutes: 10
+    # One group per PR and head: a late run for an older head can never replace or cancel a queued
+    # run for the current head, and a status is only ever written to the head its group names.
+    concurrency:
+      group: ai-sdlc-review-on-head-${{ github.repository }}-${{ needs.resolve.outputs.number }}-${{ needs.resolve.outputs.head }}
+      cancel-in-progress: false
+    # id-token: the broker serves the signed gate bundle only to a verified caller (#731 section 2).
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      statuses: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check the latest review of ${{ needs.resolve.outputs.head }} and write its status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ needs.resolve.outputs.number }}
+          HEAD: ${{ needs.resolve.outputs.head }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # GitHub runs `bash -e`, so every failing command is wrapped in if/else: the status POST must
+        # run on a failure too, or a revoked approval would leave the last success in place.
+        run: |
+          set -u
+          # A late run on a closed or merged PR leaves the head's status alone (#596). A failed state
+          # read writes the status as before.
+          if pr_state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .state 2>/dev/null) \
+             && [ "$pr_state" = closed ]; then
+            echo "::notice::PR #$PR is closed: this ${EVENT-} run leaves ai-sdlc/review-on-head on $HEAD unchanged"
+            exit 0
+          fi
+          # The signed bundle (#731 slice 1): this loader commit's fetcher and pinned verifier check
+          # the record and archive offline. Any failure is an error status, never a fallback.
+          loader=$RUNNER_TEMP/ai-sdlc-loader verifier=$RUNNER_TEMP/ai-sdlc-verifier gates=$RUNNER_TEMP/ai-sdlc-gates
+          rm -rf "$loader" "$verifier" "$gates"
+          if loader_sha=$(python3 -I - <<'NAME_LOADER'
+          import base64, json, os, re, sys, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=ai-sdlc-gates"
+          request = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(request, timeout=10))["value"]
+          part = token.split(".")[1]
+          sha = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("job_workflow_sha", "")
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              sys.exit("the OIDC token names no loader commit")
+          print(sha)
+          NAME_LOADER
+             ) \
+             && git init -q "$loader" \
+             && git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$loader_sha" \
+             && git -C "$loader" checkout -q --detach FETCH_HEAD \
+             && sh "$loader/verifier/fetch_cosign.sh" "$verifier" \
+             && python3 -I "$loader/fetch_gates.py" bundle --verifier "$verifier" --out "$gates"; then
+            if sh "$gates/scripts/review_on_head.sh" "$PR" "$HEAD" --repo "$GITHUB_REPOSITORY" > result.txt 2>&1; then code=0; else code=$?; fi
+            cat result.txt
+            line=$(head -1 result.txt | cut -c1-140)
+          else
+            echo "::error::the signed AI-SDLC gate bundle is unavailable: see the lines above"
+            code=2; line="signed gate bundle unavailable"
+          fi
+          # Read and publish in one step, inside the per-PR-and-head concurrency group. GitHub keeps
+          # the latest status per context.
+          case "$code" in 0) state=success ;; 1) state=failure ;; *) state=error ;; esac
+          # No review of this head yet is a wait, not a rejection (#622). Any other first line,
+          # including a changed message, keeps failure.
+          case "$code:$line" in "1:REVIEW-ON-HEAD FAIL: no review names "*) state=pending ;; esac
+          if gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" \
+               -f state="$state" -f context=ai-sdlc/review-on-head -f target_url="$RUN_URL" \
+               -f description="$line" > /dev/null; then
+            echo "status ai-sdlc/review-on-head=$state on $HEAD"
+            # The status holds the merge, not this job (#622).
+            [ "$code" -ne 1 ] || code=0
+          else
+            echo "::error::could not write the status ai-sdlc/review-on-head on $HEAD"; [ "$code" -ne 0 ] || code=2
+          fi
+          exit "$code"
+
+  owner-decisions:
+    name: owner-decisions.md is append-only
+    needs: resolve
+    if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: No removed lines in docs/owner-decisions.md
+        env:
+          BASE: ${{ inputs.base }}
+          PR: ${{ needs.resolve.outputs.number }}
+          SCRIPTS: ${{ inputs.scripts_dir }}
+        run: |
+          set -u
+          git fetch -q origin "$BASE" "+refs/pull/$PR/head:refs/remotes/pr/head"
+          if ! git show "origin/$BASE:$SCRIPTS/owner_decisions_check.sh" > "$RUNNER_TEMP/owner_decisions_check.sh" 2>/dev/null; then
+            echo "::error::$SCRIPTS/owner_decisions_check.sh is not on $BASE: merge the adoption PR (scripts/adopt.sh) before requiring this check"; exit 2
+          fi
+          sh "$RUNNER_TEMP/owner_decisions_check.sh" "origin/$BASE" pr/head
+
+  locked-tests:
+    name: A fix leaves its failing test alone
+    needs: resolve
+    if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Compare test files with the commit that added them
+        env:
+          BASE: ${{ inputs.base }}
+          PR: ${{ needs.resolve.outputs.number }}
+          BRANCH: ${{ needs.resolve.outputs.branch }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head }}
+          TARGET_BASE_SHA: ${{ needs.resolve.outputs.target_base_sha }}
+          SCRIPTS: ${{ inputs.scripts_dir }}
+          TEST_PATHS: ${{ inputs.test_paths }}
+        run: |
+          set -eu
+          case "$BRANCH" in fix/*) ;; *) echo "not a fix/ branch: skipped"; exit 0 ;; esac
+          record_error() { echo "LOCKED-TESTS RECORD ERROR: $*"; exit 2; }
+          full_sha() {
+            case "$1" in *[!0-9a-f]*|"") return 1 ;; esac
+            [ ${#1} -eq 40 ]
+          }
+          full_sha "$HEAD_SHA" && full_sha "$TARGET_BASE_SHA" || record_error "invalid PR commit identity"
+          git fetch -q origin "$BASE" "$TARGET_BASE_SHA" "+refs/pull/$PR/head:refs/remotes/pr/head" \
+            || record_error "could not fetch trusted source and pinned PR objects"
+          trusted=$(git rev-parse --verify "origin/$BASE^{commit}") || record_error "invalid trusted source"
+          target=$(git rev-parse --verify "$TARGET_BASE_SHA^{commit}") || record_error "invalid target object"
+          fetched_head=$(git rev-parse --verify 'pr/head^{commit}') || record_error "invalid fetched PR head"
+          [ "$target" = "$TARGET_BASE_SHA" ] && [ "$fetched_head" = "$HEAD_SHA" ] \
+            || record_error "fetched PR identity mismatch"
+          test_paths=$TEST_PATHS
+          # Only the trusted helper revision supplies executable code. Both modern
+          # and older interfaces compare against the independently pinned PR target.
+          run_locked() {
+            locked_helper_arg=$(git rev-parse --verify "$1^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid trusted source"; return 2; }
+            locked_base_arg=$(git rev-parse --verify "$2^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid base"; return 2; }
+            locked_head_arg=$(git rev-parse --verify "$3^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid head"; return 2; }
+            locked_present=$(git ls-tree --name-only "$locked_helper_arg" -- "$4") || { echo "LOCKED-TESTS RECORD ERROR: helper lookup failed"; return 2; }
+            if [ -n "$locked_present" ]; then
+              git show "$locked_helper_arg:$4" > "$5" || { echo "LOCKED-TESTS RECORD ERROR: helper read failed"; return 2; }
+              locked_help=$(python3 "$5" --help 2>&1) || { printf '%s\n' "$locked_help"; echo "LOCKED-TESTS RECORD ERROR: helper interface failed"; return 2; }
+              case "$locked_help" in
+                *"--base "*) python3 "$5" --base "$locked_base_arg" --head "$locked_head_arg" --test-paths "$test_paths"; return $? ;;
+              esac
+              locked_legacy=$5
+            else
+              locked_legacy=
+            fi
+            python3 - "$locked_base_arg" "$locked_head_arg" "$test_paths" "$locked_legacy" <<'LOCKED_PY'
+          import os, shlex, subprocess, sys
+
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, check=True).stdout
+
+          try:
+              base = git("rev-parse", "--verify", "--quiet", sys.argv[1] + "^{commit}").decode().strip()
+              head = git("rev-parse", "--verify", "--quiet", sys.argv[2] + "^{commit}").decode().strip()
+              patterns = shlex.split(sys.argv[3])
+              if not patterns:
+                  raise ValueError("no test pathspecs given")
+              commits = git("log", "--reverse", "--format=%H", base + ".." + head, "--", *patterns).splitlines()
+              if not commits:
+                  print("LOCKED-TESTS NOTE: no test commit on this branch")
+                  sys.exit(0)
+              first = commits[0].decode()
+              paths = [os.fsdecode(p) for p in git("diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z", first, "--", *patterns).split(b"\0") if p]
+              if not paths:
+                  raise ValueError("no locked test files given")
+              for path in paths:
+                  git("cat-file", "-e", first + ":" + path)
+              # An older trusted helper supports the manual interface, but not --base.
+              if len(sys.argv) > 4 and sys.argv[4]:
+                  checked = subprocess.run([sys.executable, sys.argv[4], "--test-commit", first,
+                                            "--head", head, "--tests", *("./" + path for path in paths)], capture_output=True)
+                  sys.stdout.buffer.write(checked.stdout)
+                  sys.stderr.buffer.write(checked.stderr)
+                  if checked.returncode not in (0, 1, 2):
+                      raise ValueError(f"legacy helper failed with exit {checked.returncode}")
+                  if checked.returncode == 0:
+                      print(f"LOCKED-TESTS NOTE: unchanged since {first[:12]}")
+                  sys.exit(checked.returncode)
+              changed = git("--literal-pathspecs", "diff", "--no-renames", "--name-status", first, head, "--", *paths)
+              changes = [line for line in changed.decode("utf-8", "replace").splitlines() if line.strip()]
+              if changes:
+                  print(f"LOCKED-TESTS FAIL: {len(changes)} locked file(s) changed between {first[:12]} and {head[:12]}")
+                  for line in changes:
+                      print("  " + line)
+                  print("A fix may not edit its locked test. Revert the test, or open a separate PR that changes the test, with its own review.")
+                  sys.exit(1)
+              print(f"LOCKED-TESTS OK: {len(paths)} locked file(s) unchanged between {first[:12]} and {head[:12]}")
+              print(f"LOCKED-TESTS NOTE: unchanged since {first[:12]}")
+          except (OSError, ValueError, subprocess.CalledProcessError) as error:
+              print(f"LOCKED-TESTS RECORD ERROR: {error}")
+              sys.exit(2)
+          LOCKED_PY
+          }
+          run_locked "$trusted" "$target" "$HEAD_SHA" "$SCRIPTS/locked_tests_check.py" "$RUNNER_TEMP/locked_tests_check.py"
+
+  secret-scan:
+    name: No credentials in the PR range
+    needs: resolve
+    if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Scan added lines (reports file, line and rule, never the text)
+        env:
+          BASE: ${{ inputs.base }}
+          PR: ${{ needs.resolve.outputs.number }}
+          SCRIPTS: ${{ inputs.scripts_dir }}
+        run: |
+          set -u
+          git fetch -q origin "$BASE" "+refs/pull/$PR/head:refs/remotes/pr/head"
+          if ! git show "origin/$BASE:$SCRIPTS/secret_scan.sh" > "$RUNNER_TEMP/secret_scan.sh" 2>/dev/null; then
+            echo "::error::$SCRIPTS/secret_scan.sh is not on $BASE: merge the adoption PR (scripts/adopt.sh) before requiring this check"; exit 2
+          fi
+          sh "$RUNNER_TEMP/secret_scan.sh" "origin/$BASE" pr/head
+
+      - name: Resolve trusted written-by runtime
+        id: written-by-base
+        if: github.event_name == 'pull_request_target' || github.event_name == 'pull_request'
+        env:
+          BASE: ${{ inputs.base }}
+          SCRIPTS: ${{ inputs.scripts_dir }}
+        run: |
+          set -eu
+          base_sha=$(git --no-replace-objects rev-parse --verify "origin/$BASE^{commit}") || exit 2
+          head_sha=$(git --no-replace-objects rev-parse --verify 'pr/head^{commit}') || exit 2
+          for identity in "$base_sha" "$head_sha"; do
+            case "$identity" in ''|*[!0-9a-f]*) exit 2 ;; esac
+            [ "${#identity}" -eq 40 ] || exit 2
+          done
+          marker=$(git --no-replace-objects ls-tree "$base_sha" -- "$SCRIPTS/written_by_native.version") || exit 2
+          native_required=false
+          [ -z "$marker" ] || native_required=true
+          printf 'base-sha=%s\nhead-sha=%s\nnative-required=%s\n' "$base_sha" "$head_sha" "$native_required" >> "$GITHUB_OUTPUT" || exit 2
+      - name: Go for the declared native written-by gate
+        if: steps.written-by-base.outputs.native-required == 'true'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.2'
+          cache: false
+
+      - name: Written by is filled in
+        if: github.event_name == 'pull_request_target' || github.event_name == 'pull_request'
+        env:
+          BASE: ${{ inputs.base }}
+          SCRIPTS: ${{ inputs.scripts_dir }}
+          BODY: ${{ github.event.pull_request.body }}
+          WRITTEN_BY_BASE_SHA: ${{ steps.written-by-base.outputs.base-sha }}
+          WRITTEN_BY_HEAD_SHA: ${{ steps.written-by-base.outputs.head-sha }}
+        run: |
+          set -eu
+          # BEGIN WRITTEN-BY TRUSTED GATE
+          # Evaluate the immutable base before candidate commands; retain result in parent.
+          written_by_rc=0 written_by_output= written_by_note=
+          tmp=$RUNNER_TEMP
+          scripts_dir=$SCRIPTS
+          base_sha=${WRITTEN_BY_BASE_SHA:-}
+          sha=${WRITTEN_BY_HEAD_SHA:-}
+          for identity in "$base_sha" "$sha"; do
+            case "$identity" in ''|*[!0-9a-f]*) exit 2 ;; esac
+            [ "${#identity}" -eq 40 ] || exit 2
+          done
+          base=$BASE
+          written_by_tree=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/written_by_native.version") || written_by_rc=2
+          if [ "$written_by_rc" -eq 0 ] && [ -n "$written_by_tree" ]; then
+            # Any declaration selects native, including malformed declarations: no fallback.
+            written_by_launcher=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/written_by_native.sh") || written_by_rc=2
+            case "$written_by_launcher" in '100644 blob '*|'100755 blob '*) ;; *) written_by_rc=2 ;; esac
+            if [ "$written_by_rc" -eq 0 ]; then
+              git --no-replace-objects show "$base_sha:$scripts_dir/written_by_native.sh" > "$tmp/written_by_native.sh" || written_by_rc=2
+            fi
+          elif [ "$written_by_rc" -eq 0 ]; then
+            if ! git --no-replace-objects show "$base_sha:$scripts_dir/written_by_check.py" > "$tmp/written_by_check.py" 2>/dev/null; then
+              written_by_note="$scripts_dir/written_by_check.py not on $base yet"
+              written_by_output="::warning::$scripts_dir/written_by_check.py is not on $base: skipped until the refresh PR merges"
+            fi
+          fi
+          if [ "$written_by_rc" -eq 0 ] && [ -z "$written_by_note" ]; then
+            printf '%s\n' "$BODY" > "$tmp/pr-body.txt" || written_by_rc=2
+            if [ "$written_by_rc" -eq 0 ]; then
+              git --no-replace-objects -c core.quotePath=false diff --no-renames --name-only "$base_sha...$sha" > "$tmp/pr-files.txt" || written_by_rc=2
+            fi
+            if [ "$written_by_rc" -eq 0 ]; then
+              if [ -n "$written_by_tree" ]; then
+                written_by_output=$(sh "$tmp/written_by_native.sh" --repo "$PWD" --base "$base_sha" --head "$sha" --scripts-dir "$scripts_dir" --body-file "$tmp/pr-body.txt" --files "$tmp/pr-files.txt" 2>&1) || written_by_rc=$?
+              else
+                written_by_output=$(python3 "$tmp/written_by_check.py" --body-file "$tmp/pr-body.txt" --files "$tmp/pr-files.txt" 2>&1) || written_by_rc=$?
+              fi
+            fi
+          fi
+          if [ "$written_by_rc" -ne 0 ] && [ -z "$written_by_output" ]; then
+            written_by_output='::error::written-by trusted input or helper unavailable
+          written-by: not checked (native setup failure)'
+          fi
+          # END WRITTEN-BY TRUSTED GATE
+          printf '%s\n' "$written_by_output"
+          if [ -n "$written_by_note" ]; then
+            printf '%s\n' "$scripts_dir/written_by_check.py is not on $base: skipped until the refresh PR merges" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' "$written_by_output" | tail -n 1 >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$written_by_rc"
+
+  manifest:
+    name: product.yaml is valid and a published product has its baseline
+    needs: resolve
+    if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Check the PR head's product.yaml with the base branch's script
+        env:
+          BASE: ${{ inputs.base }}
+          PR: ${{ needs.resolve.outputs.number }}
+          SCRIPTS: ${{ inputs.scripts_dir }}
+        run: |
+          set -u
+          git fetch -q origin "$BASE" "+refs/pull/$PR/head:refs/remotes/pr/head"
+          base_sha=$(git --no-replace-objects rev-parse "origin/$BASE^{commit}") || exit 2
+          sha=$(git --no-replace-objects rev-parse 'pr/head^{commit}') || exit 2
+          scripts_dir=$SCRIPTS
+          tmp=$RUNNER_TEMP
+          # BEGIN MANIFEST TRUSTED GATE
+          # Resolve policy and product bytes before candidate commands. Native failure never downgrades.
+          manifest_rc=0 manifest_output= manifest_note=
+          case "$scripts_dir" in scripts) manifest_module=tools/manifest-baseline ;; .ai-sdlc) manifest_module=.ai-sdlc/tools/manifest-baseline ;; *) manifest_rc=2; manifest_module=unsupported ;; esac
+          manifest_product=$(git --no-replace-objects ls-tree "$sha" -- product.yaml) || manifest_rc=2
+          if [ "$manifest_rc" -eq 0 ] && [ -z "$manifest_product" ]; then
+            manifest_note='no product.yaml'
+          elif [ "$manifest_rc" -eq 0 ]; then
+            case "$manifest_product" in '100644 blob '*|'100755 blob '*) ;; *) manifest_rc=2 ;; esac
+            git --no-replace-objects show "$sha:product.yaml" > "$tmp/product.yaml" || manifest_rc=2
+            manifest_tree=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/manifest_baseline_native.version" "$scripts_dir/manifest_baseline_native.sh" "$scripts_dir/manifest_baseline_build.sh" "$scripts_dir/manifest_check.sh" "$scripts_dir/baseline_gaps.sh" "$manifest_module") || manifest_rc=2
+            if [ "$manifest_rc" -eq 0 ] && [ -n "$manifest_tree" ]; then
+              manifest_launcher=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/manifest_baseline_native.sh") || manifest_rc=2
+              case "$manifest_launcher" in '100644 blob '*|'100755 blob '*) ;; *) manifest_rc=2 ;; esac
+              if [ "$manifest_rc" -eq 0 ]; then
+                git --no-replace-objects show "$base_sha:$scripts_dir/manifest_baseline_native.sh" > "$tmp/manifest_baseline_native.sh" || manifest_rc=2
+              fi
+              if [ "$manifest_rc" -eq 0 ]; then
+                manifest_output=$(sh "$tmp/manifest_baseline_native.sh" --repo "$PWD" --base "$base_sha" --head "$sha" --scripts-dir "$scripts_dir" --manifest "$tmp/product.yaml" 2>&1) || manifest_rc=$?
+              fi
+            elif [ "$manifest_rc" -eq 0 ]; then
+              # Only immutable historical bases with no native declaration/module/launcher.
+              manifest_legacy=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/manifest_check.py") || manifest_rc=2
+              case "$manifest_legacy" in '100644 blob '*|'100755 blob '*) ;; *) manifest_rc=2 ;; esac
+              if [ "$manifest_rc" -eq 0 ]; then
+                git --no-replace-objects show "$base_sha:$scripts_dir/manifest_check.py" > "$tmp/manifest_check.py" || manifest_rc=2
+              fi
+              if [ "$manifest_rc" -eq 0 ]; then
+                command -v python3 >/dev/null || { echo "::error::python3 is not on this runner"; exit 2; }
+                py=python3
+                if ! python3 -c 'import yaml' 2>/dev/null; then
+                  python3 -m venv "$RUNNER_TEMP/manifest-venv" && "$RUNNER_TEMP/manifest-venv/bin/pip" install --quiet pyyaml \
+                    || { echo "::error::PyYAML is not on this runner and could not be installed into a job venv"; exit 2; }
+                  py="$RUNNER_TEMP/manifest-venv/bin/python"
+                fi
+                manifest_output=$("$py" "$tmp/manifest_check.py" "$tmp/product.yaml" 2>&1) || manifest_rc=$?
+              fi
+            fi
+          fi
+          if [ "$manifest_rc" -ne 0 ] && [ -z "$manifest_output" ]; then
+            manifest_output='MANIFEST ERROR: trusted manifest bundle unavailable'
+          fi
+          # END MANIFEST TRUSTED GATE
+          printf '%s\n' "$manifest_output"
+          [ -z "$manifest_note" ] || printf '%s\n' "$manifest_note"
+          exit "$manifest_rc"
+
+  cloudflare-cost:
+    name: Cloudflare config stays inside the US$5 plan
+    needs: resolve
+    if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Check wrangler configs with the base branch's script and decisions
+        env:
+          BASE: ${{ inputs.base }}
+          PR: ${{ needs.resolve.outputs.number }}
+          SCRIPTS: ${{ inputs.scripts_dir }}
+        run: |
+          set -u
+          git fetch -q origin "$BASE" "+refs/pull/$PR/head:refs/remotes/pr/head"
+          base_sha=$(git rev-parse --verify "origin/$BASE^{commit}") || exit 2
+          sha=$(git rev-parse --verify 'pr/head^{commit}') || exit 2
+          scripts_dir=$SCRIPTS
+          tmp=$(mktemp -d "$RUNNER_TEMP/cf-cost-caller.XXXXXXXX") || exit 2
+          trap 'rm -rf "$tmp"' EXIT
+          # BEGIN CF-COST TRUSTED GATE
+          # Resolve and run before candidate commands. Only the immutable base selects code.
+          cf_cost_rc=0 cf_cost_output= cf_cost_note=
+          case "$scripts_dir" in scripts) cf_module=tools/cf-cost-check ;; .ai-sdlc) cf_module=.ai-sdlc/tools/cf-cost-check ;; *) cf_cost_rc=2; cf_module=unsupported ;; esac
+          cf_cost_tree=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/cf_cost_native.version" "$scripts_dir/cf_cost_native.sh" "$cf_module/go.mod") || cf_cost_rc=2
+          if [ "$cf_cost_rc" -eq 0 ] && [ -n "$cf_cost_tree" ]; then
+            cf_launcher=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/cf_cost_native.sh") || cf_cost_rc=2
+            case "$cf_launcher" in '100644 blob '*|'100755 blob '*) ;; *) cf_cost_rc=2 ;; esac
+            if [ "$cf_cost_rc" -eq 0 ]; then
+              git --no-replace-objects show "$base_sha:$scripts_dir/cf_cost_native.sh" > "$tmp/cf_cost_native.sh" || cf_cost_rc=2
+            fi
+            if [ "$cf_cost_rc" -eq 0 ]; then
+              cf_cost_output=$(sh "$tmp/cf_cost_native.sh" --repo "$PWD" --base "$base_sha" --head "$sha" --scripts-dir "$scripts_dir" 2>&1) || cf_cost_rc=$?
+            fi
+          elif [ "$cf_cost_rc" -eq 0 ]; then
+            # Compatibility only for immutable historical bases before native introduction.
+            if git --no-replace-objects show "$base_sha:$scripts_dir/cf_cost_check.py" > "$tmp/cf_cost_check.py" 2>/dev/null; then
+              set --
+              if git --no-replace-objects show "$base_sha:docs/owner-decisions.md" > "$tmp/cf-owner-decisions.md" 2>/dev/null; then
+                set -- --decisions "$tmp/cf-owner-decisions.md"
+              fi
+              if ! python3 -c 'import sys; __import__("tomllib" if sys.version_info >= (3, 11) else "tomli")' 2>/dev/null; then
+                cf_cost_rc=2
+                cf_cost_output='::error::Python 3.11+ or an importable tomli is required'
+              else
+                cf_cost_output=$(python3 "$tmp/cf_cost_check.py" --head "$sha" --base "$base_sha" "$@" 2>&1) || cf_cost_rc=$?
+              fi
+            else
+              cf_cost_note="$scripts_dir/cf_cost_check.py not on base"
+            fi
+          fi
+          if [ "$cf_cost_rc" -ne 0 ] && [ -z "$cf_cost_output" ]; then
+            cf_cost_output='CF-COST: input error: trusted native bundle unavailable'
+          fi
+          # END CF-COST TRUSTED GATE
+          if [ -n "$cf_cost_note" ]; then echo "::warning::$cf_cost_note: skipped until the refresh PR merges"; fi
+          [ -z "$cf_cost_output" ] || printf '%s\n' "$cf_cost_output"
+          exit "$cf_cost_rc"
