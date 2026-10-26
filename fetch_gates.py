@@ -32,6 +32,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 
 BROKER = "https://ai-sdlc-gates.fol2hk.workers.dev"
@@ -48,6 +49,8 @@ HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_ARCHIVE = 100 * 1024 * 1024
 MAX_UNPACKED = 512 * 1024 * 1024
+GZIP = "application/gzip"
+ZSTD = "application/zstd"
 
 
 class Refused(Exception):
@@ -127,7 +130,15 @@ def bundle_object(value: object) -> dict[str, object]:
     if not (isinstance(source, str) and HEX40.fullmatch(source) and isinstance(digest, str)
             and HEX64.fullmatch(digest) and type(size) is int and 0 < size <= MAX_ARCHIVE):
         raise Refused("bundle fields are invalid")
+    # Absent means the older zstd archive; a gzip archive needs no zstd on the runner.
+    if value.get("archive_media", ZSTD) not in (GZIP, ZSTD):
+        raise Refused("bundle archive_media is not known")
     return value
+
+
+def archive_name(bundle: dict[str, object]) -> str:
+    """The archive's file name; unpack reads its format from the suffix."""
+    return "gates.tar.gz" if bundle.get("archive_media") == GZIP else "gates.tar.zst"
 
 
 def check_record(record: dict[str, object], serial: object, now: dt.datetime) -> None:
@@ -217,12 +228,20 @@ def check_archive(body: bytes, bundle: dict[str, object]) -> None:
 def unpack(archive: Path, destination: Path) -> None:
     """Unpack into an empty directory: regular files and directories only, no escape, size capped."""
     with tempfile.TemporaryDirectory(prefix="gates-unpack-") as temporary:
-        tar_path = Path(temporary) / "gates.tar"
-        result = subprocess.run(["zstd", "-q", "-d", "-o", str(tar_path), str(archive)], capture_output=True)
-        if result.returncode != 0:
-            raise Refused("archive does not decompress")
-        with tarfile.open(tar_path) as bundle:
+        if archive.name.endswith(".tar.gz"):
+            # Python's tarfile reads gzip itself.
+            tar_path, mode = archive, "r:gz"
+        else:
+            tar_path, mode = Path(temporary) / "gates.tar", "r"
+            result = subprocess.run(["zstd", "-q", "-d", "-o", str(tar_path), str(archive)], capture_output=True)
+            if result.returncode != 0:
+                raise Refused("archive does not decompress")
+        try:
+            bundle = tarfile.open(tar_path, mode)
             members = bundle.getmembers()
+        except (tarfile.TarError, OSError, EOFError, zlib.error):
+            raise Refused("archive does not decompress") from None
+        with bundle:
             total = 0
             for member in members:
                 path = PurePosixPath(member.name)
@@ -278,7 +297,7 @@ def check_manifest(out: Path) -> None:
 def finish(record: dict[str, object], route: str, bundle: dict[str, object], body: bytes, out: Path) -> int:
     check_archive(body, bundle)
     with tempfile.TemporaryDirectory(prefix="gates-archive-") as temporary:
-        archive = Path(temporary) / "gates.tar.zst"
+        archive = Path(temporary) / archive_name(bundle)
         archive.write_bytes(body)
         unpack(archive, out)
     try:
@@ -328,7 +347,7 @@ def run(args: argparse.Namespace) -> int:
         saved = Path(args.saved)
         record = verified_record(json.loads((saved / "record.json").read_text(encoding="utf-8")), verify, utc_now())
         route, bundle = served(record, claims)
-        return finish(record, route, bundle, (saved / "gates.tar.zst").read_bytes(), Path(args.out))
+        return finish(record, route, bundle, (saved / archive_name(bundle)).read_bytes(), Path(args.out))
     answer = json.loads(broker_get(args.broker, token, "/v1/records", 10 * 1024 * 1024))
     record, signed = newest_entry(answer, verify, utc_now())
     if args.command == "record":
@@ -344,7 +363,7 @@ def run(args: argparse.Namespace) -> int:
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=False)
         (out / "record.json").write_text(json.dumps(signed, separators=(",", ":")), encoding="utf-8")
-        (out / "gates.tar.zst").write_bytes(body)
+        (out / archive_name(bundle)).write_bytes(body)
         print(f"GATES-LOADER FETCHED serial={record['serial']} route={route} source={bundle['source_sha']} "
               f"archive={bundle['archive_sha256']} loader={claims['job_workflow_sha']}")
         return 0
