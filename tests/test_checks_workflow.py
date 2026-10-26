@@ -56,5 +56,32 @@ class ChecksWorkflow(unittest.TestCase):
         self.assertEqual(WORKFLOW.count("bin=$gates/bin/$os-$arch"), 3)
 
 
+class SecurityAndNightly(unittest.TestCase):
+    SECURITY = (ROOT / ".github/workflows/security.yml").read_text()
+    NIGHTLY = (ROOT / ".github/workflows/nightly-gates.yml").read_text()
+
+    def test_scripts_come_from_the_signed_bundle(self):
+        self.assertIn('python3 "$RUNNER_TEMP/ai-sdlc-gates/scripts/security_intake.py"', self.SECURITY)
+        self.assertIn('fetch_gates.py" bundle', self.SECURITY)
+        self.assertIn('"$gates/scripts/nightly_status.py"', self.NIGHTLY)
+        self.assertIn('cat "$gates/references/lessons-audit.md"', self.NIGHTLY)
+        for text in (self.SECURITY, self.NIGHTLY):
+            self.assertNotIn("$SCRIPTS", text)
+            self.assertNotIn(".caller/", text)
+
+    def test_the_caller_cannot_supply_the_audit_command(self):
+        # ai-sdlc #731 section 6: the nightly audit_command input is removed.
+        self.assertNotIn("audit_command", self.NIGHTLY)
+        self.assertEqual(self.NIGHTLY.count('fetch_gates.py" fetch '), 1)
+
+    def test_both_may_mint_an_oidc_token(self):
+        for text in (self.SECURITY, self.NIGHTLY):
+            top = text[text.index("\npermissions:\n"):text.index("\njobs:\n")]
+            self.assertIn("\n  id-token: write\n", top)
+
+    def test_cf_cost_failure_points_to_the_one_fix(self):
+        self.assertIn("references/cloudflare.md#the-one-way-to-meet-the-limits-and-the-rate-limit", WORKFLOW)
+
+
 if __name__ == "__main__":
     unittest.main()

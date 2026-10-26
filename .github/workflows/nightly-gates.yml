@@ -1,0 +1,172 @@
+# AI-SDLC nightly lessons audit, served by the public loader (ai-sdlc #731 slice 4).
+#
+# Reusable workflow. A repo calls it from `.github/workflows/ai-sdlc-nightly.yml` on main, on
+# schedule or workflow_dispatch, with `permissions: id-token: write` besides the write scopes below.
+# The audit prompt (references/lessons-audit.md) and nightly_status.py come from the signed gate
+# bundle; the caller's `.ai-sdlc/` is not read, and the caller cannot supply the command (#731
+# section 6). The scheduled audit runs from a Claude cloud session; this is the manual run on the
+# owner's Mac runner, whose agent CLI uses the runner's own login.
+#
+# Auth contract (until the slice-5 App token): the caller grants contents, issues and
+# pull-requests write and passes `secrets: audit_token`, a token with those scopes on the repo.
+# Without it the audit runs with github.token: a PR it opens starts no checks and cannot merge on
+# its own, and the step says so.
+name: AI-SDLC nightly audit
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: Ignored; the audit runs on the Mac runner that holds the agent CLI
+        type: string
+        default: '["self-hosted", "macos"]'
+      timeout_minutes:
+        type: number
+        default: 90
+    secrets:
+      audit_token:
+        description: Token with contents, issues and pull-requests write on the repo; see the auth contract above
+        required: false
+
+# id-token: the broker serves the signed gate bundle only to a verified caller (#731 section 2).
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  audit:
+    name: Nightly lessons audit
+    runs-on: [self-hosted, macos]
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    outputs:
+      conclusion: ${{ steps.run.outcome }}
+      loader_sha: ${{ steps.gates.outputs.loader_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.audit_token || github.token }}
+      # The run's one broker fetch (#731 section 3): verify the newest unexpired signed record and
+      # the archive, keep the pair for the track job, and unpack it here.
+      - name: Load the signed gate bundle
+        id: gates
+        run: |
+          set -eu
+          command -v zstd >/dev/null || brew install zstd
+          loader=$RUNNER_TEMP/ai-sdlc-loader
+          rm -rf "$loader" "$RUNNER_TEMP/ai-sdlc-fetch" "$RUNNER_TEMP/ai-sdlc-gates"
+          loader_sha=$(python3 -I - <<'NAME_LOADER'
+          import base64, json, os, re, sys, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          url += ("&" if "?" in url else "?") + "audience=ai-sdlc-gates"
+          request = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(request, timeout=10))["value"]
+          part = token.split(".")[1]
+          sha = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("job_workflow_sha", "")
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              sys.exit("the OIDC token names no loader commit")
+          print(sha)
+          NAME_LOADER
+          )
+          echo "loader_sha=$loader_sha" >> "$GITHUB_OUTPUT"
+          git init -q "$loader"
+          git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$loader_sha"
+          git -C "$loader" checkout -q --detach FETCH_HEAD
+          sh "$loader/verifier/fetch_cosign.sh" "$RUNNER_TEMP/ai-sdlc-verifier"
+          python3 -I "$loader/fetch_gates.py" fetch --verifier "$RUNNER_TEMP/ai-sdlc-verifier" --out "$RUNNER_TEMP/ai-sdlc-fetch"
+          sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$RUNNER_TEMP/ai-sdlc-gates"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ai-sdlc-gates
+          path: ${{ runner.temp }}/ai-sdlc-fetch
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
+      - name: Run the audit
+        id: run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.audit_token || github.token }}
+          HAS_AUDIT_TOKEN: ${{ secrets.audit_token != '' }}
+        run: |
+          set -u
+          if [ "$HAS_AUDIT_TOKEN" != true ]; then
+            echo "::warning::no audit_token secret: the audit runs with github.token, so a PR it opens starts no checks and cannot merge on its own. Pass secrets.audit_token from the caller."
+          fi
+          git config user.name "ai-sdlc nightly audit"
+          git config user.email "ai-sdlc-nightly@users.noreply.github.com"
+          gates=$RUNNER_TEMP/ai-sdlc-gates
+          # The skill's files for this run are the verified bundle, not the runner's installed copy.
+          prompt=$(printf 'Runtime note: the AI-SDLC skill files for this run are the signed gate bundle in %s. Wherever this prompt names ~/.claude/skills/ai-sdlc/, use %s/ instead.\n\n' "$gates" "$gates"; cat "$gates/references/lessons-audit.md")
+          # The runner's shell has errexit on, so the status is captured in a conditional; else a red
+          # audit ends the step here and its log tail never reaches the run log.
+          code=0
+          claude -p "$prompt" --permission-mode acceptEdits \
+            --allowedTools "Bash(git:*) Bash(gh:*) Bash(date:*) Bash(python3 $gates/scripts/bookmark.py:*) Read Edit Write Grep Glob" \
+            > audit.log 2>&1 || code=$?
+          tail -c 20000 audit.log
+          echo "exit=$code"
+          exit $code
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: audit-log
+          path: audit.log
+          retention-days: 14
+
+  track:
+    name: One open issue while the audit is red
+    needs: audit
+    if: always()
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    timeout-minutes: 10
+    # A running tracking job is never cancelled. A waiting one may be replaced by a newer run's job, which reports the newer outcome.
+    concurrency:
+      group: ai-sdlc-nightly-track-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: ai-sdlc-gates
+          path: ${{ runner.temp }}/ai-sdlc-fetch
+      - name: Open, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ needs.audit.outputs.conclusion }}
+          LOADER_SHA: ${{ needs.audit.outputs.loader_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -u
+          gh label create ai-sdlc-nightly-red --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "The AI-SDLC nightly audit is failing" --force || exit 1
+          # The signed bundle (#731 section 3): verify the run's saved pair again, then unpack it.
+          gates=$RUNNER_TEMP/ai-sdlc-gates loader=$RUNNER_TEMP/ai-sdlc-loader
+          rm -rf "$gates" "$loader"
+          load_gates() {
+            [ -n "$LOADER_SHA" ] && git init -q "$loader" \
+              && git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$LOADER_SHA" \
+              && git -C "$loader" checkout -q --detach FETCH_HEAD \
+              && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+          }
+          if load_gates; then
+            if [ "$OUTCOME" != success ]; then
+              python3 -I "$gates/scripts/nightly_status.py" --repo "$GITHUB_REPOSITORY" red --runner "workflow run #$RUN_NUMBER" --cause "the audit step failed: $RUN_URL"
+            else
+              python3 -I "$gates/scripts/nightly_status.py" --repo "$GITHUB_REPOSITORY" green --result "Workflow run #$RUN_NUMBER passed: $RUN_URL"
+            fi
+            exit $?
+          fi
+          # No verified bundle (the audit job failed before its fetch, or a check failed): the run is
+          # red whatever the audit did, so report it without the bundle's script.
+          echo "::warning::the signed gate bundle is unavailable: the tracking issue is written without nightly_status.py"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label ai-sdlc-nightly-red --state open --limit 1 --json number --jq '.[0].number // empty')
+          body=$(printf 'The nightly lessons audit, or loading its signed gate bundle, failed.\n\nRun #%s: %s' "$RUN_NUMBER" "$RUN_URL")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "AI-SDLC nightly audit red (run #$RUN_NUMBER)" --label ai-sdlc-nightly-red --body "$body"
+          fi
