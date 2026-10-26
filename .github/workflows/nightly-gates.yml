@@ -91,8 +91,10 @@ jobs:
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
           echo "::add-mask::$auth"
           # git and gh take the App token from this step's environment only, never from .git/config.
-          export GH_TOKEN GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
-          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          # An empty first value clears any other extraheader, so git sends one Authorization.
+          export GH_TOKEN GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0=""
+          export GIT_CONFIG_KEY_1=http.https://github.com/.extraheader GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $auth"
           git config user.name "ai-sdlc nightly audit"
           git config user.email "ai-sdlc-nightly@users.noreply.github.com"
           gates=$RUNNER_TEMP/ai-sdlc-gates

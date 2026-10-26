@@ -357,8 +357,6 @@ class Pins(unittest.TestCase):
                          self.CONTRACT["trusted_root.json"])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RepoToken(unittest.TestCase):
@@ -402,3 +400,7 @@ class RepoToken(unittest.TestCase):
                     mock.patch("sys.stdout", new_callable=io.StringIO):
                 self.assertEqual(loader.main(["repo-token", "--out", f"{directory}/t"]), code)
                 self.assertFalse(Path(f"{directory}/t").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
