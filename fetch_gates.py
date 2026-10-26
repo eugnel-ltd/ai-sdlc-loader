@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -244,12 +245,37 @@ def verified_record(bundle: object, verify, now: dt.datetime) -> dict[str, objec
     return record
 
 
+def check_manifest(out: Path) -> None:
+    """Every unpacked file is listed in MANIFEST.sha256 with its digest, and nothing else (#731 section 4)."""
+    try:
+        lines = (out / "MANIFEST.sha256").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        raise Refused("archive has no MANIFEST.sha256") from None
+    listed = {}
+    for line in lines:
+        digest, separator, name = line.partition("  ")
+        if not separator or not HEX64.fullmatch(digest) or not name or name in listed:
+            raise Refused("MANIFEST.sha256 has a bad line")
+        listed[name] = digest
+    found = {path.relative_to(out).as_posix() for path in out.rglob("*") if path.is_file()} - {"MANIFEST.sha256"}
+    if found != set(listed):
+        raise Refused("unpacked files differ from MANIFEST.sha256")
+    for name, digest in listed.items():
+        if hashlib.sha256((out / name).read_bytes()).hexdigest() != digest:
+            raise Refused(f"{name} differs from MANIFEST.sha256")
+
+
 def finish(record: dict[str, object], route: str, bundle: dict[str, object], body: bytes, out: Path) -> int:
     check_archive(body, bundle)
     with tempfile.TemporaryDirectory(prefix="gates-archive-") as temporary:
         archive = Path(temporary) / "gates.tar.zst"
         archive.write_bytes(body)
         unpack(archive, out)
+    try:
+        check_manifest(out)
+    except Refused:
+        shutil.rmtree(out, ignore_errors=True)
+        raise
     print(f"GATES-LOADER OK serial={record['serial']} route={route} source={bundle['source_sha']} "
           f"archive={bundle['archive_sha256']}")
     return 0

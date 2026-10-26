@@ -11,9 +11,11 @@
 # verifies the newest unexpired signed record and the archive with the pinned verifier, and keeps
 # the pair as a run artifact. review-on-head, owner-decisions, locked-tests and secret-scan
 # download it, verify it again (load_gates.sh: same loader commit, signature, expiry, route,
-# digest), unpack it into $RUNNER_TEMP and run their scripts from it (slices 1 and 2). They never
-# fall back to another copy. The written-by, manifest and Cloudflare-cost gates still read the
-# caller's `.ai-sdlc/` until slice 3. Each job reads the PR as data and never runs PR code.
+# digest, MANIFEST.sha256), unpack it into $RUNNER_TEMP and run their scripts from it (slices 1
+# and 2). The written-by, manifest and Cloudflare-cost gates run the archive's prebuilt binaries
+# for the runner's OS and architecture (slice 3), so runners build nothing. No gate reads the
+# caller's `.ai-sdlc/`, and none falls back to another copy. Each job reads the PR as data and
+# never runs PR code.
 #
 # Runner (#731 section 7): GitHub-hosted only for a public repo, else [self-hosted, linux]. The
 # caller's runs_on is accepted and ignored.
@@ -27,7 +29,7 @@ on:
         type: string
         default: main
       scripts_dir:
-        description: Where the skill's check scripts live in this repo
+        description: Ignored; every gate runs from the signed archive (ai-sdlc #731)
         type: string
         default: .ai-sdlc
       test_paths:
@@ -424,91 +426,42 @@ jobs:
           load_gates || { echo "::error::the signed AI-SDLC gate bundle is unavailable: see the lines above"; exit 2; }
           sh "$gates/scripts/secret_scan.sh" "origin/$BASE" pr/head
 
-      - name: Resolve trusted written-by runtime
-        id: written-by-base
-        if: github.event_name == 'pull_request_target' || github.event_name == 'pull_request'
-        env:
-          BASE: ${{ inputs.base }}
-          SCRIPTS: ${{ inputs.scripts_dir }}
-        run: |
-          set -eu
-          base_sha=$(git --no-replace-objects rev-parse --verify "origin/$BASE^{commit}") || exit 2
-          head_sha=$(git --no-replace-objects rev-parse --verify 'pr/head^{commit}') || exit 2
-          for identity in "$base_sha" "$head_sha"; do
-            case "$identity" in ''|*[!0-9a-f]*) exit 2 ;; esac
-            [ "${#identity}" -eq 40 ] || exit 2
-          done
-          marker=$(git --no-replace-objects ls-tree "$base_sha" -- "$SCRIPTS/written_by_native.version") || exit 2
-          native_required=false
-          [ -z "$marker" ] || native_required=true
-          printf 'base-sha=%s\nhead-sha=%s\nnative-required=%s\n' "$base_sha" "$head_sha" "$native_required" >> "$GITHUB_OUTPUT" || exit 2
-      - name: Go for the declared native written-by gate
-        if: steps.written-by-base.outputs.native-required == 'true'
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: '1.27.2'
-          cache: false
-
       - name: Written by is filled in
         if: github.event_name == 'pull_request_target' || github.event_name == 'pull_request'
         env:
           BASE: ${{ inputs.base }}
-          SCRIPTS: ${{ inputs.scripts_dir }}
           BODY: ${{ github.event.pull_request.body }}
-          WRITTEN_BY_BASE_SHA: ${{ steps.written-by-base.outputs.base-sha }}
-          WRITTEN_BY_HEAD_SHA: ${{ steps.written-by-base.outputs.head-sha }}
         run: |
-          set -eu
-          # BEGIN WRITTEN-BY TRUSTED GATE
-          # Evaluate the immutable base before candidate commands; retain result in parent.
-          written_by_rc=0 written_by_output= written_by_note=
-          tmp=$RUNNER_TEMP
-          scripts_dir=$SCRIPTS
-          base_sha=${WRITTEN_BY_BASE_SHA:-}
-          sha=${WRITTEN_BY_HEAD_SHA:-}
-          for identity in "$base_sha" "$sha"; do
-            case "$identity" in ''|*[!0-9a-f]*) exit 2 ;; esac
-            [ "${#identity}" -eq 40 ] || exit 2
-          done
-          base=$BASE
-          written_by_tree=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/written_by_native.version") || written_by_rc=2
-          if [ "$written_by_rc" -eq 0 ] && [ -n "$written_by_tree" ]; then
-            # Any declaration selects native, including malformed declarations: no fallback.
-            written_by_launcher=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/written_by_native.sh") || written_by_rc=2
-            case "$written_by_launcher" in '100644 blob '*|'100755 blob '*) ;; *) written_by_rc=2 ;; esac
-            if [ "$written_by_rc" -eq 0 ]; then
-              git --no-replace-objects show "$base_sha:$scripts_dir/written_by_native.sh" > "$tmp/written_by_native.sh" || written_by_rc=2
-            fi
-          elif [ "$written_by_rc" -eq 0 ]; then
-            if ! git --no-replace-objects show "$base_sha:$scripts_dir/written_by_check.py" > "$tmp/written_by_check.py" 2>/dev/null; then
-              written_by_note="$scripts_dir/written_by_check.py not on $base yet"
-              written_by_output="::warning::$scripts_dir/written_by_check.py is not on $base: skipped until the refresh PR merges"
-            fi
+          set -u
+          # The scan step of this job unpacked and checked the signed bundle.
+          gates=$RUNNER_TEMP/ai-sdlc-gates
+          # The prebuilt gate binaries for this runner (#731 section 4: runners build nothing).
+          case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
+          case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
+          bin=$gates/bin/$os-$arch
+          written_by_rc=0 written_by_output=
+          base_sha=$(git --no-replace-objects rev-parse --verify "origin/$BASE^{commit}") || written_by_rc=2
+          sha=$(git --no-replace-objects rev-parse --verify 'pr/head^{commit}') || written_by_rc=2
+          [ -x "$bin/written-by" ] || written_by_rc=2
+          if [ "$written_by_rc" -eq 0 ]; then
+            printf '%s\n' "$BODY" > "$RUNNER_TEMP/pr-body.txt" \
+              && git --no-replace-objects -c core.quotePath=false diff --no-renames --name-only "$base_sha...$sha" > "$RUNNER_TEMP/pr-files.txt" \
+              || written_by_rc=2
           fi
-          if [ "$written_by_rc" -eq 0 ] && [ -z "$written_by_note" ]; then
-            printf '%s\n' "$BODY" > "$tmp/pr-body.txt" || written_by_rc=2
-            if [ "$written_by_rc" -eq 0 ]; then
-              git --no-replace-objects -c core.quotePath=false diff --no-renames --name-only "$base_sha...$sha" > "$tmp/pr-files.txt" || written_by_rc=2
-            fi
-            if [ "$written_by_rc" -eq 0 ]; then
-              if [ -n "$written_by_tree" ]; then
-                written_by_output=$(sh "$tmp/written_by_native.sh" --repo "$PWD" --base "$base_sha" --head "$sha" --scripts-dir "$scripts_dir" --body-file "$tmp/pr-body.txt" --files "$tmp/pr-files.txt" 2>&1) || written_by_rc=$?
-              else
-                written_by_output=$(python3 "$tmp/written_by_check.py" --body-file "$tmp/pr-body.txt" --files "$tmp/pr-files.txt" 2>&1) || written_by_rc=$?
-              fi
-            fi
+          if [ "$written_by_rc" -eq 0 ]; then
+            written_by_output=$("$bin/written-by" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt" 2>&1) || written_by_rc=$?
+            # The native exit and last-line contract (ai-sdlc scripts/written_by_native.sh).
+            case "$written_by_rc:$(printf '%s\n' "$written_by_output" | tail -n 1)" in
+              '0:written-by: native'|'0:written-by: vendor'|'0:written-by: design'|'0:written-by: lane-failed'|'0:written-by: claude'|'0:written-by: docs only'|'0:written-by: operational data only'|'1:written-by: unknown'|2:*) ;;
+              *) written_by_rc=2 written_by_output="::error::written-by native result violates exit/output contract" ;;
+            esac
           fi
           if [ "$written_by_rc" -ne 0 ] && [ -z "$written_by_output" ]; then
             written_by_output='::error::written-by trusted input or helper unavailable
           written-by: not checked (native setup failure)'
           fi
-          # END WRITTEN-BY TRUSTED GATE
           printf '%s\n' "$written_by_output"
-          if [ -n "$written_by_note" ]; then
-            printf '%s\n' "$scripts_dir/written_by_check.py is not on $base: skipped until the refresh PR merges" >> "$GITHUB_STEP_SUMMARY"
-          else
-            printf '%s\n' "$written_by_output" | tail -n 1 >> "$GITHUB_STEP_SUMMARY"
-          fi
+          printf '%s\n' "$written_by_output" | tail -n 1 >> "$GITHUB_STEP_SUMMARY"
           exit "$written_by_rc"
 
   manifest:
@@ -521,64 +474,41 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - name: Check the PR head's product.yaml with the base branch's script
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: ai-sdlc-gates
+          path: ${{ runner.temp }}/ai-sdlc-fetch
+      - name: Check the PR head's product.yaml with the signed archive's manifest-check
         env:
           BASE: ${{ inputs.base }}
           PR: ${{ needs.resolve.outputs.number }}
-          SCRIPTS: ${{ inputs.scripts_dir }}
+          LOADER_SHA: ${{ needs.resolve.outputs.loader_sha }}
         run: |
           set -u
           git fetch -q origin "$BASE" "+refs/pull/$PR/head:refs/remotes/pr/head"
-          base_sha=$(git --no-replace-objects rev-parse "origin/$BASE^{commit}") || exit 2
           sha=$(git --no-replace-objects rev-parse 'pr/head^{commit}') || exit 2
-          scripts_dir=$SCRIPTS
-          tmp=$RUNNER_TEMP
-          # BEGIN MANIFEST TRUSTED GATE
-          # Resolve policy and product bytes before candidate commands. Native failure never downgrades.
-          manifest_rc=0 manifest_output= manifest_note=
-          case "$scripts_dir" in scripts) manifest_module=tools/manifest-baseline ;; .ai-sdlc) manifest_module=.ai-sdlc/tools/manifest-baseline ;; *) manifest_rc=2; manifest_module=unsupported ;; esac
-          manifest_product=$(git --no-replace-objects ls-tree "$sha" -- product.yaml) || manifest_rc=2
-          if [ "$manifest_rc" -eq 0 ] && [ -z "$manifest_product" ]; then
-            manifest_note='no product.yaml'
-          elif [ "$manifest_rc" -eq 0 ]; then
-            case "$manifest_product" in '100644 blob '*|'100755 blob '*) ;; *) manifest_rc=2 ;; esac
-            git --no-replace-objects show "$sha:product.yaml" > "$tmp/product.yaml" || manifest_rc=2
-            manifest_tree=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/manifest_baseline_native.version" "$scripts_dir/manifest_baseline_native.sh" "$scripts_dir/manifest_baseline_build.sh" "$scripts_dir/manifest_check.sh" "$scripts_dir/baseline_gaps.sh" "$manifest_module") || manifest_rc=2
-            if [ "$manifest_rc" -eq 0 ] && [ -n "$manifest_tree" ]; then
-              manifest_launcher=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/manifest_baseline_native.sh") || manifest_rc=2
-              case "$manifest_launcher" in '100644 blob '*|'100755 blob '*) ;; *) manifest_rc=2 ;; esac
-              if [ "$manifest_rc" -eq 0 ]; then
-                git --no-replace-objects show "$base_sha:$scripts_dir/manifest_baseline_native.sh" > "$tmp/manifest_baseline_native.sh" || manifest_rc=2
-              fi
-              if [ "$manifest_rc" -eq 0 ]; then
-                manifest_output=$(sh "$tmp/manifest_baseline_native.sh" --repo "$PWD" --base "$base_sha" --head "$sha" --scripts-dir "$scripts_dir" --manifest "$tmp/product.yaml" 2>&1) || manifest_rc=$?
-              fi
-            elif [ "$manifest_rc" -eq 0 ]; then
-              # Only immutable historical bases with no native declaration/module/launcher.
-              manifest_legacy=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/manifest_check.py") || manifest_rc=2
-              case "$manifest_legacy" in '100644 blob '*|'100755 blob '*) ;; *) manifest_rc=2 ;; esac
-              if [ "$manifest_rc" -eq 0 ]; then
-                git --no-replace-objects show "$base_sha:$scripts_dir/manifest_check.py" > "$tmp/manifest_check.py" || manifest_rc=2
-              fi
-              if [ "$manifest_rc" -eq 0 ]; then
-                command -v python3 >/dev/null || { echo "::error::python3 is not on this runner"; exit 2; }
-                py=python3
-                if ! python3 -c 'import yaml' 2>/dev/null; then
-                  python3 -m venv "$RUNNER_TEMP/manifest-venv" && "$RUNNER_TEMP/manifest-venv/bin/pip" install --quiet pyyaml \
-                    || { echo "::error::PyYAML is not on this runner and could not be installed into a job venv"; exit 2; }
-                  py="$RUNNER_TEMP/manifest-venv/bin/python"
-                fi
-                manifest_output=$("$py" "$tmp/manifest_check.py" "$tmp/product.yaml" 2>&1) || manifest_rc=$?
-              fi
-            fi
-          fi
-          if [ "$manifest_rc" -ne 0 ] && [ -z "$manifest_output" ]; then
-            manifest_output='MANIFEST ERROR: trusted manifest bundle unavailable'
-          fi
-          # END MANIFEST TRUSTED GATE
-          printf '%s\n' "$manifest_output"
-          [ -z "$manifest_note" ] || printf '%s\n' "$manifest_note"
-          exit "$manifest_rc"
+          # The product file is data; it is read before any check runs.
+          product=$(git --no-replace-objects ls-tree "$sha" -- product.yaml) || exit 2
+          if [ -z "$product" ]; then echo "no product.yaml"; exit 0; fi
+          case "$product" in '100644 blob '*|'100755 blob '*) ;; *) echo "MANIFEST ERROR: product.yaml is not a regular file"; exit 2 ;; esac
+          git --no-replace-objects show "$sha:product.yaml" > "$RUNNER_TEMP/product.yaml" || exit 2
+          # The signed bundle (#731 section 3): verify the run's saved pair again, then unpack it.
+          gates=$RUNNER_TEMP/ai-sdlc-gates loader=$RUNNER_TEMP/ai-sdlc-loader
+          rm -rf "$gates" "$loader"
+          load_gates() {
+            [ -n "$LOADER_SHA" ] && git init -q "$loader" \
+              && git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$LOADER_SHA" \
+              && git -C "$loader" checkout -q --detach FETCH_HEAD \
+              && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+          }
+          load_gates || { echo "MANIFEST ERROR: trusted manifest bundle unavailable"; exit 2; }
+          # The prebuilt gate binaries for this runner (#731 section 4: runners build nothing).
+          case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
+          case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
+          bin=$gates/bin/$os-$arch
+          [ -x "$bin/manifest-check" ] || { echo "MANIFEST ERROR: trusted manifest bundle unavailable"; exit 2; }
+          "$bin/manifest-check" "$RUNNER_TEMP/product.yaml"
 
   cloudflare-cost:
     name: Cloudflare config stays inside the US$5 plan
@@ -590,54 +520,39 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - name: Check wrangler configs with the base branch's script and decisions
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: ai-sdlc-gates
+          path: ${{ runner.temp }}/ai-sdlc-fetch
+      - name: Check wrangler configs with the signed archive's cf-cost-check and the base's decisions
         env:
           BASE: ${{ inputs.base }}
           PR: ${{ needs.resolve.outputs.number }}
-          SCRIPTS: ${{ inputs.scripts_dir }}
+          LOADER_SHA: ${{ needs.resolve.outputs.loader_sha }}
         run: |
           set -u
           git fetch -q origin "$BASE" "+refs/pull/$PR/head:refs/remotes/pr/head"
           base_sha=$(git rev-parse --verify "origin/$BASE^{commit}") || exit 2
           sha=$(git rev-parse --verify 'pr/head^{commit}') || exit 2
-          scripts_dir=$SCRIPTS
-          tmp=$(mktemp -d "$RUNNER_TEMP/cf-cost-caller.XXXXXXXX") || exit 2
-          trap 'rm -rf "$tmp"' EXIT
-          # BEGIN CF-COST TRUSTED GATE
-          # Resolve and run before candidate commands. Only the immutable base selects code.
-          cf_cost_rc=0 cf_cost_output= cf_cost_note=
-          case "$scripts_dir" in scripts) cf_module=tools/cf-cost-check ;; .ai-sdlc) cf_module=.ai-sdlc/tools/cf-cost-check ;; *) cf_cost_rc=2; cf_module=unsupported ;; esac
-          cf_cost_tree=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/cf_cost_native.version" "$scripts_dir/cf_cost_native.sh" "$cf_module/go.mod") || cf_cost_rc=2
-          if [ "$cf_cost_rc" -eq 0 ] && [ -n "$cf_cost_tree" ]; then
-            cf_launcher=$(git --no-replace-objects ls-tree "$base_sha" -- "$scripts_dir/cf_cost_native.sh") || cf_cost_rc=2
-            case "$cf_launcher" in '100644 blob '*|'100755 blob '*) ;; *) cf_cost_rc=2 ;; esac
-            if [ "$cf_cost_rc" -eq 0 ]; then
-              git --no-replace-objects show "$base_sha:$scripts_dir/cf_cost_native.sh" > "$tmp/cf_cost_native.sh" || cf_cost_rc=2
-            fi
-            if [ "$cf_cost_rc" -eq 0 ]; then
-              cf_cost_output=$(sh "$tmp/cf_cost_native.sh" --repo "$PWD" --base "$base_sha" --head "$sha" --scripts-dir "$scripts_dir" 2>&1) || cf_cost_rc=$?
-            fi
-          elif [ "$cf_cost_rc" -eq 0 ]; then
-            # Compatibility only for immutable historical bases before native introduction.
-            if git --no-replace-objects show "$base_sha:$scripts_dir/cf_cost_check.py" > "$tmp/cf_cost_check.py" 2>/dev/null; then
-              set --
-              if git --no-replace-objects show "$base_sha:docs/owner-decisions.md" > "$tmp/cf-owner-decisions.md" 2>/dev/null; then
-                set -- --decisions "$tmp/cf-owner-decisions.md"
-              fi
-              if ! python3 -c 'import sys; __import__("tomllib" if sys.version_info >= (3, 11) else "tomli")' 2>/dev/null; then
-                cf_cost_rc=2
-                cf_cost_output='::error::Python 3.11+ or an importable tomli is required'
-              else
-                cf_cost_output=$(python3 "$tmp/cf_cost_check.py" --head "$sha" --base "$base_sha" "$@" 2>&1) || cf_cost_rc=$?
-              fi
-            else
-              cf_cost_note="$scripts_dir/cf_cost_check.py not on base"
-            fi
+          # The signed bundle (#731 section 3): verify the run's saved pair again, then unpack it.
+          gates=$RUNNER_TEMP/ai-sdlc-gates loader=$RUNNER_TEMP/ai-sdlc-loader
+          rm -rf "$gates" "$loader"
+          load_gates() {
+            [ -n "$LOADER_SHA" ] && git init -q "$loader" \
+              && git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$LOADER_SHA" \
+              && git -C "$loader" checkout -q --detach FETCH_HEAD \
+              && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+          }
+          load_gates || { echo "CF-COST: input error: trusted native bundle unavailable"; exit 2; }
+          # The prebuilt gate binaries for this runner (#731 section 4: runners build nothing).
+          case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
+          case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
+          bin=$gates/bin/$os-$arch
+          [ -x "$bin/cf-cost-check" ] || { echo "CF-COST: input error: trusted native bundle unavailable"; exit 2; }
+          # The base's owner decisions may allow a paid feature; the PR's own copy never counts.
+          set --
+          if git --no-replace-objects show "$base_sha:docs/owner-decisions.md" > "$RUNNER_TEMP/owner-decisions.md" 2>/dev/null; then
+            set -- --decisions "$RUNNER_TEMP/owner-decisions.md"
           fi
-          if [ "$cf_cost_rc" -ne 0 ] && [ -z "$cf_cost_output" ]; then
-            cf_cost_output='CF-COST: input error: trusted native bundle unavailable'
-          fi
-          # END CF-COST TRUSTED GATE
-          if [ -n "$cf_cost_note" ]; then echo "::warning::$cf_cost_note: skipped until the refresh PR merges"; fi
-          [ -z "$cf_cost_output" ] || printf '%s\n' "$cf_cost_output"
-          exit "$cf_cost_rc"
+          "$bin/cf-cost-check" --head "$sha" --base "$base_sha" "$@"
