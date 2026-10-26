@@ -1,0 +1,52 @@
+# The loader moves its own v3 tag (ai-sdlc #731 contract G). Every 15 minutes, and on dispatch, it
+# reads the newest signed release record through the broker with this workflow's OIDC identity,
+# verifies it offline with the pinned verifier, and moves v3 to the record's newest loader commit:
+# the last entry of `loader_shas`. During a promotion transition the list holds the old and the new
+# commit, newest last (contract E). The target must be a commit on main. Only GitHub Actions may
+# move tags here (the tag ruleset), and only this workflow has contents: write.
+name: Tag sync
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: tag-sync
+  cancel-in-progress: false
+
+jobs:
+  tag-sync:
+    name: Move v3 to the newest signed loader commit
+    if: github.repository == 'eugnel-ltd/ai-sdlc-loader' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Read the newest signed record and move v3
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh verifier/fetch_cosign.sh "$RUNNER_TEMP/verifier"
+          python3 -I fetch_gates.py record --verifier "$RUNNER_TEMP/verifier" --out "$RUNNER_TEMP/record.json"
+          target=$(python3 -I -c 'import json, sys; shas = json.load(open(sys.argv[1])).get("loader_shas") or []; print(shas[-1] if shas else "")' "$RUNNER_TEMP/record.json")
+          if [ -z "$target" ]; then
+            echo "TAG-SYNC WAIT: the record names no loader commit for v3"
+            exit 0
+          fi
+          [[ "$target" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::the record's loader commit is not a 40-hex sha"; exit 1; }
+          git merge-base --is-ancestor "$target" origin/main || { echo "::error::$target is not a commit on main"; exit 1; }
+          current=$(git ls-remote origin refs/tags/v3 | cut -f1)
+          if [ "$current" = "$target" ]; then
+            echo "TAG-SYNC OK: v3 is already at $target"
+            exit 0
+          fi
+          git push -f origin "$target:refs/tags/v3"
+          echo "TAG-SYNC MOVED: v3 ${current:-none} -> $target"
