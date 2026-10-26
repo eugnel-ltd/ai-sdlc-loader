@@ -155,6 +155,13 @@ class Unpack(unittest.TestCase):
                     loader.unpack(archive, Path(directory) / "out")
                 self.assertFalse((Path(directory) / "out").exists())
 
+    def test_over_the_size_cap_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = tar_zst(directory, [file_member("a", b"12345"), file_member("b", b"12345")])
+            with mock.patch.object(loader, "MAX_UNPACKED", 9), self.assertRaises(loader.Refused):
+                loader.unpack(archive, Path(directory) / "out")
+            self.assertFalse((Path(directory) / "out").exists())
+
     def test_digest_and_size_must_match(self):
         loader.check_archive(b"archive", bundle())
         with self.assertRaises(loader.Refused):
@@ -182,6 +189,27 @@ class Main(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(paths, ["/v1/records", f"/v1/archive/{bundle(body=body)['archive_sha256']}"])
         unpack.assert_called_once()
+
+    def test_record_run_writes_the_newest_record_and_fetches_no_archive(self):
+        answer = json.dumps({"records": [entry(record(1)), entry(record(2, loader_shas=[LOADER]))]}).encode()
+        paths = []
+
+        def broker_get(_broker, _token, path, _limit):
+            paths.append(path)
+            return answer
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(loader, "oidc_token", return_value="token"), \
+                mock.patch.object(loader, "broker_get", side_effect=broker_get), \
+                mock.patch.object(loader, "cosign_verifies", return_value=True), \
+                mock.patch.object(loader, "utc_now", return_value=NOW), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = loader.main(["record", "--verifier", directory, "--out", f"{directory}/record.json"])
+            written = json.loads(Path(f"{directory}/record.json").read_text())
+        self.assertEqual(code, 0)
+        self.assertEqual(paths, ["/v1/records"])
+        self.assertEqual((written["serial"], written["loader_shas"]), (2, [LOADER]))
+        self.assertIn(f"serial=2 loader_shas={LOADER}", out.getvalue())
 
     def test_a_refusal_exits_one_and_never_prints_the_token(self):
         token = "h." + base64.urlsafe_b64encode(json.dumps(claims(OTHER)).encode()).decode().rstrip("=") + ".secret"

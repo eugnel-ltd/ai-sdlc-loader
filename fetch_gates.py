@@ -35,7 +35,7 @@ PREDICATE_TYPE = "https://eugnel.com/ai-sdlc/record/v1"
 CERTIFICATE_IDENTITY = "https://github.com/eugnel-ltd/ai-sdlc/.github/workflows/release-tag.yml@refs/heads/main"
 OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 LOADER_WORKFLOW = re.compile(
-    r"eugnel-ltd/ai-sdlc-loader/\.github/workflows/[a-z-]+\.yml@(refs/tags/v3|refs/heads/main|[0-9a-f]{40})"
+    r"eugnel-ltd/ai-sdlc-loader/\.github/workflows/(?:checks|security|nightly-gates)\.yml@(refs/tags/v3|refs/heads/main|[0-9a-f]{40})"
 )
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")

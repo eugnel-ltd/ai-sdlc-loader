@@ -161,7 +161,8 @@ jobs:
           rm -rf "$loader" "$verifier" "$gates"
           if loader_sha=$(python3 -I - <<'NAME_LOADER'
           import base64, json, os, re, sys, urllib.request
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=ai-sdlc-gates"
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          url += ("&" if "?" in url else "?") + "audience=ai-sdlc-gates"
           request = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
           token = json.load(urllib.request.urlopen(request, timeout=10))["value"]
           part = token.split(".")[1]
