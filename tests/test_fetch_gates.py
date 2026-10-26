@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -141,6 +142,21 @@ def tar_zst(directory, members):
     return out
 
 
+def tar_gz(directory, members):
+    out = Path(directory) / "in.tar.gz"
+    with tarfile.open(out, mode="w:gz") as archive:
+        for info, data in members:
+            archive.addfile(info, io.BytesIO(data) if data is not None else None)
+    return out
+
+
+def without_zstd(directory):
+    """PATH holds only an empty directory, so no zstd can run."""
+    empty = Path(directory) / "empty-path"
+    empty.mkdir()
+    return mock.patch.dict(os.environ, {"PATH": str(empty)})
+
+
 def file_member(name, data=b"x"):
     info = tarfile.TarInfo(name)
     info.size = len(data)
@@ -222,10 +238,61 @@ class Unpack(unittest.TestCase):
                 with self.assertRaises(loader.Refused):
                     loader.unpack(archive, Path(directory) / "out")
 
+    def test_a_gzip_archive_unpacks_without_zstd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = tar_gz(directory, [file_member("./scripts/a.sh", b"echo ok\n")])
+            with without_zstd(directory):
+                loader.unpack(archive, Path(directory) / "out")
+            self.assertEqual((Path(directory) / "out/scripts/a.sh").read_bytes(), b"echo ok\n")
+
+    def test_a_gzip_archive_keeps_every_member_check(self):
+        link = tarfile.TarInfo("scripts/link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc/passwd"
+        setuid, data = file_member("scripts/a.sh")
+        setuid.mode = 0o4755
+        for members in ([file_member("../evil")], [file_member("/abs")], [(link, None)], [(setuid, data)]):
+            with tempfile.TemporaryDirectory() as directory:
+                archive = tar_gz(directory, members)
+                with without_zstd(directory), self.assertRaises(loader.Refused):
+                    loader.unpack(archive, Path(directory) / "out")
+                self.assertFalse((Path(directory) / "out").exists())
+        with tempfile.TemporaryDirectory() as directory:
+            archive = tar_gz(directory, [file_member("a", b"12345"), file_member("b", b"12345")])
+            with mock.patch.object(loader, "MAX_UNPACKED", 9), self.assertRaises(loader.Refused):
+                loader.unpack(archive, Path(directory) / "out")
+
+    def test_a_corrupt_gzip_archive_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "in.tar.gz"
+            archive.write_bytes(b"\x1f\x8bnot gzip at all")
+            with self.assertRaises(loader.Refused):
+                loader.unpack(archive, Path(directory) / "out")
+            self.assertFalse((Path(directory) / "out").exists())
+
     def test_digest_and_size_must_match(self):
         loader.check_archive(b"archive", bundle())
         with self.assertRaises(loader.Refused):
             loader.check_archive(b"archivf", bundle())
+
+
+class ArchiveMedia(unittest.TestCase):
+    def test_gzip_zstd_and_absent_media_are_accepted(self):
+        loader.bundle_object(bundle())
+        for media in ("application/gzip", "application/zstd"):
+            loader.bundle_object({**bundle(), "archive_media": media})
+
+    def test_an_unknown_media_is_refused_on_every_route(self):
+        for media in ("application/x-tar", "", None, 1):
+            odd = {**bundle(), "archive_media": media}
+            with self.assertRaises(loader.Refused):
+                loader.bundle_object(odd)
+            with self.assertRaises(loader.Refused):
+                loader.check_record(record(1, current=odd), 1, NOW)
+            with self.assertRaises(loader.Refused):
+                loader.check_record(record(1, pin=odd), 1, NOW)
+            with self.assertRaises(loader.Refused):
+                loader.served(record(1, candidate={"loader_sha": LOADER, **odd}), claims(LOADER))
 
 
 class Main(unittest.TestCase):
@@ -307,6 +374,37 @@ class Main(unittest.TestCase):
     def test_fetch_saves_the_pair_and_unpack_needs_no_broker(self):
         fetched, code, later_paths, unpacked = self.fetch_then_unpack(claims(LOADER))
         self.assertEqual((fetched, code, later_paths, unpacked), (0, 0, [], True))
+
+    def test_a_gzip_record_fetches_and_unpacks_without_zstd(self):
+        script = b"echo ok\n"
+        manifest = f"{hashlib.sha256(script).hexdigest()}  scripts/a.sh\n".encode()
+        token = "h." + base64.urlsafe_b64encode(json.dumps(claims(LOADER)).encode()).decode().rstrip("=") + ".s"
+        with tempfile.TemporaryDirectory() as directory:
+            body = tar_gz(directory, [file_member("scripts/a.sh", script),
+                                      file_member("MANIFEST.sha256", manifest)]).read_bytes()
+            candidate = {"loader_sha": LOADER, "archive_media": "application/gzip", **bundle(body=body)}
+            answer = json.dumps({"records": [entry(record(1, candidate=candidate))]}).encode()
+            saved, out = Path(directory) / "saved", Path(directory) / "out"
+            with without_zstd(directory), \
+                    mock.patch.object(loader, "oidc_token", return_value=token), \
+                    mock.patch.object(loader, "broker_get",
+                                      side_effect=lambda _b, _t, path, _l: answer if path == "/v1/records" else body), \
+                    mock.patch.object(loader, "cosign_verifies", return_value=True), \
+                    mock.patch.object(loader, "utc_now", return_value=NOW), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(loader.main(["fetch", "--verifier", directory, "--out", str(saved)]), 0)
+                self.assertEqual(sorted(p.name for p in saved.iterdir()), ["gates.tar.gz", "record.json"])
+                self.assertEqual(loader.main(["unpack", "--verifier", directory, "--saved", str(saved),
+                                              "--loader-sha", LOADER, "--out", str(out)]), 0)
+                self.assertEqual((out / "scripts/a.sh").read_bytes(), script)
+                self.assertEqual(loader.main(["bundle", "--verifier", directory, "--out", f"{out}-bundle"]), 0)
+                self.assertEqual(Path(f"{out}-bundle/scripts/a.sh").read_bytes(), script)
+
+    def test_a_zstd_record_saves_a_zstd_archive(self):
+        def zstd_saved(saved):
+            self.assertEqual(sorted(p.name for p in saved.iterdir()), ["gates.tar.zst", "record.json"])
+        fetched, code, _, unpacked = self.fetch_then_unpack(claims(LOADER), zstd_saved)
+        self.assertEqual((fetched, code, unpacked), (0, 0, True))
 
     def test_unpack_refuses_another_loader_commit(self):
         _, code, _, unpacked = self.fetch_then_unpack(claims(OTHER, OTHER))
