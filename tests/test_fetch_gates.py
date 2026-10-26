@@ -192,6 +192,36 @@ class Unpack(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(loader.Refused):
             loader.check_manifest(Path(directory))
 
+    def test_unpack_works_without_the_extraction_filter(self):
+        # Python before 3.12 has no tarfile.data_filter and no extractall(filter=...).
+        real = loader.tarfile.TarFile.extractall
+
+        def old_extractall(self, path=".", members=None, *, numeric_owner=False, **kwargs):
+            if kwargs:
+                raise TypeError("TarFile.extractall() got an unexpected keyword argument 'filter'")
+            return real(self, path, members, numeric_owner=numeric_owner, filter="data")
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(loader.tarfile.__dict__), \
+                mock.patch.object(loader.tarfile.TarFile, "extractall", old_extractall):
+            del loader.tarfile.__dict__["data_filter"]
+            archive = tar_zst(directory, [file_member("scripts/a.sh", b"echo\n")])
+            loader.unpack(archive, Path(directory) / "out")
+            self.assertEqual((Path(directory) / "out/scripts/a.sh").read_bytes(), b"echo\n")
+
+    def test_setuid_and_setgid_modes_are_refused(self):
+        # A group-writable checkout (umask 002) is normal on a runner and stays allowed.
+        info, data = file_member("scripts/a.sh")
+        info.mode = 0o664
+        with tempfile.TemporaryDirectory() as directory:
+            loader.unpack(tar_zst(directory, [(info, data)]), Path(directory) / "out")
+        for mode in (0o4755, 0o2755, 0o6755):
+            info, data = file_member("scripts/a.sh")
+            info.mode = mode
+            with tempfile.TemporaryDirectory() as directory:
+                archive = tar_zst(directory, [(info, data)])
+                with self.assertRaises(loader.Refused):
+                    loader.unpack(archive, Path(directory) / "out")
+
     def test_digest_and_size_must_match(self):
         loader.check_archive(b"archive", bundle())
         with self.assertRaises(loader.Refused):
