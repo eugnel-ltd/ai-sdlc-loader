@@ -214,10 +214,11 @@ class Main(unittest.TestCase):
                 mock.patch.object(loader, "broker_get", side_effect=broker_get), \
                 mock.patch.object(loader, "cosign_verifies", return_value=True), \
                 mock.patch.object(loader, "utc_now", return_value=NOW), \
-                mock.patch.object(loader, "check_manifest"), \
+                mock.patch.object(loader, "check_manifest") as check_manifest, \
                 mock.patch.object(loader, "unpack") as unpack:
             code = loader.main(["bundle", "--verifier", directory, "--out", f"{directory}/out"])
         self.assertEqual(code, 0)
+        check_manifest.assert_called_once_with(Path(f"{directory}/out"))
         self.assertEqual(paths, ["/v1/records", f"/v1/archive/{bundle(body=body)['archive_sha256']}"])
         unpack.assert_called_once()
 
@@ -259,7 +260,7 @@ class Main(unittest.TestCase):
                 mock.patch.object(loader, "broker_get", side_effect=broker_get), \
                 mock.patch.object(loader, "cosign_verifies", return_value=True), \
                 mock.patch.object(loader, "utc_now", return_value=NOW), \
-                mock.patch.object(loader, "check_manifest"), \
+                mock.patch.object(loader, "check_manifest") as check_manifest, \
                 mock.patch.object(loader, "unpack") as unpack:
             with mock.patch.object(loader, "oidc_token", return_value=token(claims(LOADER))):
                 fetched = loader.main(["fetch", "--verifier", directory, "--out", f"{directory}/saved"])
@@ -270,7 +271,8 @@ class Main(unittest.TestCase):
                     mock.patch.object(loader, "cosign_verifies", return_value=verify_on_unpack):
                 code = loader.main(["unpack", "--verifier", directory, "--saved", f"{directory}/saved",
                                     "--loader-sha", LOADER, "--out", f"{directory}/out"])
-        return fetched, code, paths[calls:], unpack.called
+        # Unpacked means unpacked and checked against MANIFEST.sha256.
+        return fetched, code, paths[calls:], unpack.called and check_manifest.called
 
     def test_fetch_saves_the_pair_and_unpack_needs_no_broker(self):
         fetched, code, later_paths, unpacked = self.fetch_then_unpack(claims(LOADER))

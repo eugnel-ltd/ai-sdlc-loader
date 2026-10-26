@@ -46,8 +46,10 @@ class ChecksWorkflow(unittest.TestCase):
 
     def test_native_gates_run_the_archive_binaries(self):
         # Slice 3: no gate reads the caller's copies or builds anything.
-        for tool in ("written-by", "manifest-check", "cf-cost-check"):
-            self.assertIn(f'"$bin/{tool}"', WORKFLOW)
+        for call in ('"$bin/written-by" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt"',
+                     '"$bin/manifest-check" "$RUNNER_TEMP/product.yaml"',
+                     '"$bin/cf-cost-check" --head "$sha" --base "$base_sha" "$@"'):
+            self.assertIn(call, WORKFLOW)
         self.assertNotIn("$SCRIPTS", WORKFLOW)
         self.assertNotIn("setup-go", WORKFLOW)
         self.assertNotIn("go build", WORKFLOW)

@@ -479,7 +479,7 @@ jobs:
         with:
           name: ai-sdlc-gates
           path: ${{ runner.temp }}/ai-sdlc-fetch
-      - name: Check the PR head's product.yaml with the base branch's script
+      - name: Check the PR head's product.yaml with the signed archive's manifest-check
         env:
           BASE: ${{ inputs.base }}
           PR: ${{ needs.resolve.outputs.number }}
@@ -525,7 +525,7 @@ jobs:
         with:
           name: ai-sdlc-gates
           path: ${{ runner.temp }}/ai-sdlc-fetch
-      - name: Check wrangler configs with the base branch's script and decisions
+      - name: Check wrangler configs with the signed archive's cf-cost-check and the base's decisions
         env:
           BASE: ${{ inputs.base }}
           PR: ${{ needs.resolve.outputs.number }}
