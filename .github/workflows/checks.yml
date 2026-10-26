@@ -7,12 +7,13 @@
 # The jobs, job names and the status `ai-sdlc/review-on-head` are the same as in ai-sdlc's
 # checks.yml, byte for byte (#731 section 8).
 #
-# review-on-head runs review_on_head.sh from the signed gate bundle (slice 1). Its step takes this
-# loader commit's fetch_gates.py and the pinned verifier. It gets an Actions OIDC token for the
-# broker, verifies the newest unexpired signed record and the archive digest offline, and unpacks
-# the bundle into $RUNNER_TEMP. If any check fails, it writes an `error` status and never falls
-# back to another copy. The other jobs still read the caller's `.ai-sdlc/` on its base until
-# slice 2 moves them. Each job reads the PR as data and never runs PR code, as before.
+# One broker fetch per run (#731 section 3). `resolve` names this loader commit from its OIDC token,
+# verifies the newest unexpired signed record and the archive with the pinned verifier, and keeps
+# the pair as a run artifact. review-on-head, owner-decisions, locked-tests and secret-scan
+# download it, verify it again (load_gates.sh: same loader commit, signature, expiry, route,
+# digest), unpack it into $RUNNER_TEMP and run their scripts from it (slices 1 and 2). They never
+# fall back to another copy. The written-by, manifest and Cloudflare-cost gates still read the
+# caller's `.ai-sdlc/` until slice 3. Each job reads the PR as data and never runs PR code.
 #
 # Runner (#731 section 7): GitHub-hosted only for a public repo, else [self-hosted, linux]. The
 # caller's runs_on is accepted and ignored.
@@ -38,11 +39,13 @@ on:
         type: string
         default: '["self-hosted", "linux"]'
 
+# id-token: every job that fetches or verifies the signed bundle mints an Actions OIDC token.
 permissions:
   contents: read
   pull-requests: read
   issues: read
   statuses: write
+  id-token: write
 
 # The PR's own commits are fetched as data (refs/pull/<n>/head) and never checked out as the
 # working tree the scripts run from. The refspec forces the update ("+"): a self-hosted runner

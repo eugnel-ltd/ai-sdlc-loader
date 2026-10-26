@@ -24,6 +24,13 @@ class ChecksWorkflow(unittest.TestCase):
             self.assertIn(f"\n  {job}:\n    name: {name}\n", WORKFLOW)
         self.assertIn("context=ai-sdlc/review-on-head", WORKFLOW)
 
+    def test_every_job_may_mint_an_oidc_token(self):
+        # A called workflow's permissions block sets id-token to none when it leaves it out.
+        top = WORKFLOW[WORKFLOW.index("\npermissions:\n"):WORKFLOW.index("\njobs:\n")]
+        self.assertIn("\n  id-token: write\n", top)
+        for block in WORKFLOW.split("\n    permissions:\n")[1:]:
+            self.assertIn("      id-token: write\n", block.split("\n    steps:")[0])
+
     def test_one_broker_fetch_per_run(self):
         self.assertEqual(WORKFLOW.count('fetch_gates.py" fetch '), 1)
         self.assertNotIn('fetch_gates.py" bundle', WORKFLOW)
