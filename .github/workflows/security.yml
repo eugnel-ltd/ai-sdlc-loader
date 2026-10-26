@@ -10,8 +10,9 @@
 # `permissions: id-token: write`. security_intake.py comes from the signed gate bundle, which this
 # loader commit's fetch_gates.py and pinned verifier check before use; the caller's `.ai-sdlc/`
 # is not read. Free tools only (owner, 14 Oct 2026: no paid Actions minutes): [self-hosted, macos]
-# for a private repo, GitHub-hosted only for a public one (#731 section 7). The runner needs
-# Homebrew (gitleaks, osv-scanner, zstd) and python3 (semgrep goes into a throwaway venv).
+# for a private repo, GitHub-hosted only for a public one (#731 section 7). With Homebrew (the Mac
+# runner) the step installs any missing gitleaks, osv-scanner and zstd; without it (GitHub-hosted
+# Ubuntu) it takes pinned release binaries checked by SHA-256. semgrep goes into a throwaway venv.
 # The scanners read the tree; nothing in it runs. Issues name the file, the line and the rule,
 # never the matched text: gitleaks runs with --redact and the intake reads no text fields.
 name: AI-SDLC weekly security
@@ -48,10 +49,33 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Install the scanners (free; Homebrew and a throwaway venv)
+      - name: Install the scanners (free; Homebrew or pinned release binaries, and a throwaway venv)
         run: |
           set -eu
-          for t in gitleaks osv-scanner zstd; do command -v "$t" >/dev/null || brew install "$t"; done
+          if command -v brew >/dev/null; then
+            for t in gitleaks osv-scanner zstd; do command -v "$t" >/dev/null || brew install "$t"; done
+          else
+            # Linux without Homebrew (GitHub-hosted, public repos): release binaries checked by SHA-256.
+            case "$(uname -m)" in
+              x86_64|amd64) gl=x64 osv=amd64
+                gl_sum=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+                osv_sum=160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b ;;
+              aarch64|arm64) gl=arm64 osv=arm64
+                gl_sum=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+                osv_sum=4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7 ;;
+              *) echo "::error::no pinned scanner build for $(uname -m)"; exit 1 ;;
+            esac
+            bin=$RUNNER_TEMP/sec-bin; mkdir -p "$bin"
+            curl -fsSL -o "$bin/gitleaks.tar.gz" "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_$gl.tar.gz"
+            echo "$gl_sum  $bin/gitleaks.tar.gz" | sha256sum -c -
+            tar -xzf "$bin/gitleaks.tar.gz" -C "$bin" gitleaks
+            curl -fsSL -o "$bin/osv-scanner" "https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_$osv"
+            echo "$osv_sum  $bin/osv-scanner" | sha256sum -c -
+            chmod 755 "$bin/gitleaks" "$bin/osv-scanner"
+            echo "$bin" >> "$GITHUB_PATH"
+            PATH=$bin:$PATH
+            command -v zstd >/dev/null || { echo "::error::zstd is not on this runner"; exit 1; }
+          fi
           python3 -m venv "$RUNNER_TEMP/sec-venv"
           "$RUNNER_TEMP/sec-venv/bin/python" -m pip install -q semgrep==1.181.0
           gitleaks version; osv-scanner --version | head -1; "$RUNNER_TEMP/sec-venv/bin/semgrep" --version
@@ -101,5 +125,5 @@ jobs:
             --description "Found by the weekly AI-SDLC security scan" --force
           for l in intent security; do gh label create "$l" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true; done
           out=$RUNNER_TEMP/sec
-          python3 "$RUNNER_TEMP/ai-sdlc-gates/scripts/security_intake.py" --repo "$GITHUB_REPOSITORY" --root . \
+          python3 -I "$RUNNER_TEMP/ai-sdlc-gates/scripts/security_intake.py" --repo "$GITHUB_REPOSITORY" --root . \
             --gitleaks "$out/gitleaks.json" --osv "$out/osv.json" --semgrep "$out/semgrep.json" --file
