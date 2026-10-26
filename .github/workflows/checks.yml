@@ -61,6 +61,7 @@ jobs:
       target_base_sha: ${{ steps.pr.outputs.target_base_sha }}
       target_base_ref: ${{ steps.pr.outputs.target_base_ref }}
       is_pr: ${{ steps.pr.outputs.is_pr }}
+      loader_sha: ${{ steps.gates.outputs.loader_sha }}
     steps:
       - id: pr
         env:
@@ -116,6 +117,44 @@ jobs:
           echo "target_base_sha=$target_base_sha" >> "$GITHUB_OUTPUT"
           echo "target_base_ref=$target_base_ref" >> "$GITHUB_OUTPUT"
           echo "is_pr=true" >> "$GITHUB_OUTPUT"
+      # The run's one broker fetch (#731 section 3): this loader commit's fetcher and pinned verifier
+      # check the record and archive, and later jobs check the saved pair again before they unpack it.
+      # A failure here leaves no artifact, so each gate fails closed in its own job.
+      - name: Fetch the signed gate bundle for this run
+        id: gates
+        if: steps.pr.outputs.is_pr == 'true'
+        continue-on-error: true
+        run: |
+          set -eu
+          loader=$RUNNER_TEMP/ai-sdlc-loader
+          rm -rf "$loader" "$RUNNER_TEMP/ai-sdlc-fetch"
+          loader_sha=$(python3 -I - <<'NAME_LOADER'
+          import base64, json, os, re, sys, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          url += ("&" if "?" in url else "?") + "audience=ai-sdlc-gates"
+          request = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(request, timeout=10))["value"]
+          part = token.split(".")[1]
+          sha = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("job_workflow_sha", "")
+          if not re.fullmatch(r"[0-9a-f]{40}", sha):
+              sys.exit("the OIDC token names no loader commit")
+          print(sha)
+          NAME_LOADER
+          )
+          echo "loader_sha=$loader_sha" >> "$GITHUB_OUTPUT"
+          git init -q "$loader"
+          git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$loader_sha"
+          git -C "$loader" checkout -q --detach FETCH_HEAD
+          sh "$loader/verifier/fetch_cosign.sh" "$RUNNER_TEMP/ai-sdlc-verifier"
+          python3 -I "$loader/fetch_gates.py" fetch --verifier "$RUNNER_TEMP/ai-sdlc-verifier" --out "$RUNNER_TEMP/ai-sdlc-fetch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.gates.outcome == 'success'
+        with:
+          name: ai-sdlc-gates
+          path: ${{ runner.temp }}/ai-sdlc-fetch
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
 
   review-on-head:
     name: Independent APPROVE names the head
@@ -137,9 +176,15 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: ai-sdlc-gates
+          path: ${{ runner.temp }}/ai-sdlc-fetch
       - name: Check the latest review of ${{ needs.resolve.outputs.head }} and write its status
         env:
           GH_TOKEN: ${{ github.token }}
+          LOADER_SHA: ${{ needs.resolve.outputs.loader_sha }}
           EVENT: ${{ github.event_name }}
           PR: ${{ needs.resolve.outputs.number }}
           HEAD: ${{ needs.resolve.outputs.head }}
@@ -155,28 +200,17 @@ jobs:
             echo "::notice::PR #$PR is closed: this ${EVENT-} run leaves ai-sdlc/review-on-head on $HEAD unchanged"
             exit 0
           fi
-          # The signed bundle (#731 slice 1): this loader commit's fetcher and pinned verifier check
-          # the record and archive offline. Any failure is an error status, never a fallback.
-          loader=$RUNNER_TEMP/ai-sdlc-loader verifier=$RUNNER_TEMP/ai-sdlc-verifier gates=$RUNNER_TEMP/ai-sdlc-gates
-          rm -rf "$loader" "$verifier" "$gates"
-          if loader_sha=$(python3 -I - <<'NAME_LOADER'
-          import base64, json, os, re, sys, urllib.request
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
-          url += ("&" if "?" in url else "?") + "audience=ai-sdlc-gates"
-          request = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-          token = json.load(urllib.request.urlopen(request, timeout=10))["value"]
-          part = token.split(".")[1]
-          sha = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("job_workflow_sha", "")
-          if not re.fullmatch(r"[0-9a-f]{40}", sha):
-              sys.exit("the OIDC token names no loader commit")
-          print(sha)
-          NAME_LOADER
-             ) \
-             && git init -q "$loader" \
-             && git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$loader_sha" \
-             && git -C "$loader" checkout -q --detach FETCH_HEAD \
-             && sh "$loader/verifier/fetch_cosign.sh" "$verifier" \
-             && python3 -I "$loader/fetch_gates.py" bundle --verifier "$verifier" --out "$gates"; then
+          # The signed bundle (#731 section 3): verify the run's saved pair again, then unpack it.
+          # Any failure is an error status, never a fallback.
+          gates=$RUNNER_TEMP/ai-sdlc-gates loader=$RUNNER_TEMP/ai-sdlc-loader
+          rm -rf "$gates" "$loader"
+          load_gates() {
+            [ -n "$LOADER_SHA" ] && git init -q "$loader" \
+              && git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$LOADER_SHA" \
+              && git -C "$loader" checkout -q --detach FETCH_HEAD \
+              && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+          }
+          if load_gates; then
             if sh "$gates/scripts/review_on_head.sh" "$PR" "$HEAD" --repo "$GITHUB_REPOSITORY" > result.txt 2>&1; then code=0; else code=$?; fi
             cat result.txt
             line=$(head -1 result.txt | cut -c1-140)
@@ -211,18 +245,30 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: ai-sdlc-gates
+          path: ${{ runner.temp }}/ai-sdlc-fetch
       - name: No removed lines in docs/owner-decisions.md
         env:
           BASE: ${{ inputs.base }}
           PR: ${{ needs.resolve.outputs.number }}
-          SCRIPTS: ${{ inputs.scripts_dir }}
+          LOADER_SHA: ${{ needs.resolve.outputs.loader_sha }}
         run: |
           set -u
           git fetch -q origin "$BASE" "+refs/pull/$PR/head:refs/remotes/pr/head"
-          if ! git show "origin/$BASE:$SCRIPTS/owner_decisions_check.sh" > "$RUNNER_TEMP/owner_decisions_check.sh" 2>/dev/null; then
-            echo "::error::$SCRIPTS/owner_decisions_check.sh is not on $BASE: merge the adoption PR (scripts/adopt.sh) before requiring this check"; exit 2
-          fi
-          sh "$RUNNER_TEMP/owner_decisions_check.sh" "origin/$BASE" pr/head
+          # The signed bundle (#731 section 3): verify the run's saved pair again, then unpack it.
+          gates=$RUNNER_TEMP/ai-sdlc-gates loader=$RUNNER_TEMP/ai-sdlc-loader
+          rm -rf "$gates" "$loader"
+          load_gates() {
+            [ -n "$LOADER_SHA" ] && git init -q "$loader" \
+              && git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$LOADER_SHA" \
+              && git -C "$loader" checkout -q --detach FETCH_HEAD \
+              && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+          }
+          load_gates || { echo "::error::the signed AI-SDLC gate bundle is unavailable: see the lines above"; exit 2; }
+          sh "$gates/scripts/owner_decisions_check.sh" "origin/$BASE" pr/head
 
   locked-tests:
     name: A fix leaves its failing test alone
@@ -234,14 +280,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: ai-sdlc-gates
+          path: ${{ runner.temp }}/ai-sdlc-fetch
       - name: Compare test files with the commit that added them
         env:
+          LOADER_SHA: ${{ needs.resolve.outputs.loader_sha }}
           BASE: ${{ inputs.base }}
           PR: ${{ needs.resolve.outputs.number }}
           BRANCH: ${{ needs.resolve.outputs.branch }}
           HEAD_SHA: ${{ needs.resolve.outputs.head }}
           TARGET_BASE_SHA: ${{ needs.resolve.outputs.target_base_sha }}
-          SCRIPTS: ${{ inputs.scripts_dir }}
           TEST_PATHS: ${{ inputs.test_paths }}
         run: |
           set -eu
@@ -260,15 +311,23 @@ jobs:
           [ "$target" = "$TARGET_BASE_SHA" ] && [ "$fetched_head" = "$HEAD_SHA" ] \
             || record_error "fetched PR identity mismatch"
           test_paths=$TEST_PATHS
-          # Only the trusted helper revision supplies executable code. Both modern
-          # and older interfaces compare against the independently pinned PR target.
+          # Only the signed bundle supplies the helper. Both modern and older interfaces compare
+          # against the independently pinned PR target.
+          # The signed bundle (#731 section 3): verify the run's saved pair again, then unpack it.
+          gates=$RUNNER_TEMP/ai-sdlc-gates loader=$RUNNER_TEMP/ai-sdlc-loader
+          rm -rf "$gates" "$loader"
+          load_gates() {
+            [ -n "$LOADER_SHA" ] && git init -q "$loader" \
+              && git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$LOADER_SHA" \
+              && git -C "$loader" checkout -q --detach FETCH_HEAD \
+              && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+          }
+          load_gates || record_error "the signed AI-SDLC gate bundle is unavailable"
           run_locked() {
-            locked_helper_arg=$(git rev-parse --verify "$1^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid trusted source"; return 2; }
             locked_base_arg=$(git rev-parse --verify "$2^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid base"; return 2; }
             locked_head_arg=$(git rev-parse --verify "$3^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid head"; return 2; }
-            locked_present=$(git ls-tree --name-only "$locked_helper_arg" -- "$4") || { echo "LOCKED-TESTS RECORD ERROR: helper lookup failed"; return 2; }
-            if [ -n "$locked_present" ]; then
-              git show "$locked_helper_arg:$4" > "$5" || { echo "LOCKED-TESTS RECORD ERROR: helper read failed"; return 2; }
+            if [ -f "$4" ]; then
+              cp "$4" "$5" || { echo "LOCKED-TESTS RECORD ERROR: helper read failed"; return 2; }
               locked_help=$(python3 "$5" --help 2>&1) || { printf '%s\n' "$locked_help"; echo "LOCKED-TESTS RECORD ERROR: helper interface failed"; return 2; }
               case "$locked_help" in
                 *"--base "*) python3 "$5" --base "$locked_base_arg" --head "$locked_head_arg" --test-paths "$test_paths"; return $? ;;
@@ -325,7 +384,7 @@ jobs:
               sys.exit(2)
           LOCKED_PY
           }
-          run_locked "$trusted" "$target" "$HEAD_SHA" "$SCRIPTS/locked_tests_check.py" "$RUNNER_TEMP/locked_tests_check.py"
+          run_locked "$trusted" "$target" "$HEAD_SHA" "$gates/scripts/locked_tests_check.py" "$RUNNER_TEMP/locked_tests_check.py"
 
   secret-scan:
     name: No credentials in the PR range
@@ -337,18 +396,30 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: ai-sdlc-gates
+          path: ${{ runner.temp }}/ai-sdlc-fetch
       - name: Scan added lines (reports file, line and rule, never the text)
         env:
           BASE: ${{ inputs.base }}
           PR: ${{ needs.resolve.outputs.number }}
-          SCRIPTS: ${{ inputs.scripts_dir }}
+          LOADER_SHA: ${{ needs.resolve.outputs.loader_sha }}
         run: |
           set -u
           git fetch -q origin "$BASE" "+refs/pull/$PR/head:refs/remotes/pr/head"
-          if ! git show "origin/$BASE:$SCRIPTS/secret_scan.sh" > "$RUNNER_TEMP/secret_scan.sh" 2>/dev/null; then
-            echo "::error::$SCRIPTS/secret_scan.sh is not on $BASE: merge the adoption PR (scripts/adopt.sh) before requiring this check"; exit 2
-          fi
-          sh "$RUNNER_TEMP/secret_scan.sh" "origin/$BASE" pr/head
+          # The signed bundle (#731 section 3): verify the run's saved pair again, then unpack it.
+          gates=$RUNNER_TEMP/ai-sdlc-gates loader=$RUNNER_TEMP/ai-sdlc-loader
+          rm -rf "$gates" "$loader"
+          load_gates() {
+            [ -n "$LOADER_SHA" ] && git init -q "$loader" \
+              && git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$LOADER_SHA" \
+              && git -C "$loader" checkout -q --detach FETCH_HEAD \
+              && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+          }
+          load_gates || { echo "::error::the signed AI-SDLC gate bundle is unavailable: see the lines above"; exit 2; }
+          sh "$gates/scripts/secret_scan.sh" "origin/$BASE" pr/head
 
       - name: Resolve trusted written-by runtime
         id: written-by-base

@@ -10,12 +10,12 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 
 | File | What it does |
 |---|---|
-| `.github/workflows/checks.yml` | The PR checks. Slice 1 runs `review-on-head` from the signed bundle. The other jobs still read the caller's `.ai-sdlc/` until slice 2. |
+| `.github/workflows/checks.yml` | The PR checks. The first job fetches the signed record and bundle once and keeps them as a run artifact. `review-on-head`, `owner-decisions`, `locked-tests` and `secret-scan` verify that pair again and run their scripts from the bundle. The written-by, manifest and Cloudflare-cost gates still read the caller's `.ai-sdlc/` until slice 3. |
 | `.github/workflows/tag-sync.yml` | Moves `v3` to the newest loader commit in the signed record (contract G). |
 | `.github/workflows/ai-sdlc-checks.yml` | This repo's own PR gate. It calls `checks.yml` at `main`. |
-| `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. |
+| `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. `fetch` is the run's one broker call; `unpack` checks the saved pair again in a later job. |
+| `load_gates.sh` | Runs `unpack` with this loader commit's pinned verifier. |
 | `verifier/` | A byte copy of ai-sdlc `gates/verifier/` (contract C). Change both together in reviewed PRs. |
-| `.ai-sdlc/` | The two shell gates that this repo's own PR checks still read until slice 2. |
 
 ## Which bundle a call gets
 
@@ -30,4 +30,4 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 - `main` needs the status `ai-sdlc/review-on-head`: an independent APPROVE from a company other than every writer's, on the PR head.
 - Only GitHub Actions can move tags. Only `tag-sync.yml` has `contents: write`.
 
-Test: `python3 -m unittest -v tests/test_fetch_gates.py` (needs `zstd`).
+Test: `python3 -m unittest discover -v -s tests` (needs `zstd`).

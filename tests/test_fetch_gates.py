@@ -221,6 +221,52 @@ class Main(unittest.TestCase):
         self.assertEqual((written["serial"], written["loader_shas"]), (2, [LOADER]))
         self.assertIn(f"serial=2 loader_shas={LOADER}", out.getvalue())
 
+    def fetch_then_unpack(self, unpack_claims, tamper=None, verify_on_unpack=True):
+        body = b"archive"
+        signed = entry(record(1, candidate={"loader_sha": LOADER, **bundle(body=body)}))
+        answer = json.dumps({"records": [signed]}).encode()
+        paths = []
+
+        def broker_get(_broker, _token, path, _limit):
+            paths.append(path)
+            return answer if path == "/v1/records" else body
+
+        def token(claim):
+            return "h." + base64.urlsafe_b64encode(json.dumps(claim).encode()).decode().rstrip("=") + ".s"
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(loader, "broker_get", side_effect=broker_get), \
+                mock.patch.object(loader, "cosign_verifies", return_value=True), \
+                mock.patch.object(loader, "utc_now", return_value=NOW), \
+                mock.patch.object(loader, "unpack") as unpack:
+            with mock.patch.object(loader, "oidc_token", return_value=token(claims(LOADER))):
+                fetched = loader.main(["fetch", "--verifier", directory, "--out", f"{directory}/saved"])
+            if tamper:
+                tamper(Path(directory) / "saved")
+            calls = len(paths)
+            with mock.patch.object(loader, "oidc_token", return_value=token(unpack_claims)), \
+                    mock.patch.object(loader, "cosign_verifies", return_value=verify_on_unpack):
+                code = loader.main(["unpack", "--verifier", directory, "--saved", f"{directory}/saved",
+                                    "--loader-sha", LOADER, "--out", f"{directory}/out"])
+        return fetched, code, paths[calls:], unpack.called
+
+    def test_fetch_saves_the_pair_and_unpack_needs_no_broker(self):
+        fetched, code, later_paths, unpacked = self.fetch_then_unpack(claims(LOADER))
+        self.assertEqual((fetched, code, later_paths, unpacked), (0, 0, [], True))
+
+    def test_unpack_refuses_another_loader_commit(self):
+        _, code, _, unpacked = self.fetch_then_unpack(claims(OTHER, OTHER))
+        self.assertEqual((code, unpacked), (1, False))
+
+    def test_unpack_refuses_a_changed_archive(self):
+        _, code, _, unpacked = self.fetch_then_unpack(
+            claims(LOADER), lambda saved: (saved / "gates.tar.zst").write_bytes(b"archivf"))
+        self.assertEqual((code, unpacked), (1, False))
+
+    def test_unpack_refuses_a_record_that_no_longer_verifies(self):
+        _, code, _, unpacked = self.fetch_then_unpack(claims(LOADER), verify_on_unpack=False)
+        self.assertEqual((code, unpacked), (1, False))
+
     def test_a_refusal_exits_one_and_never_prints_the_token(self):
         token = "h." + base64.urlsafe_b64encode(json.dumps(claims(OTHER)).encode()).decode().rstrip("=") + ".secret"
         answer = json.dumps({"records": [entry(record(1))]}).encode()
