@@ -29,7 +29,7 @@ class ChecksWorkflow(unittest.TestCase):
         top = WORKFLOW[WORKFLOW.index("\npermissions:\n"):WORKFLOW.index("\njobs:\n")]
         self.assertIn("\n  id-token: write\n", top)
         for block in WORKFLOW.split("\n    permissions:\n")[1:]:
-            self.assertIn("      id-token: write\n", block.split("\n    steps:")[0])
+            self.assertIn("      id-token: write", block.split("\n    steps:")[0])
 
     def test_one_broker_fetch_per_run(self):
         self.assertEqual(WORKFLOW.count('fetch_gates.py" fetch '), 1)
