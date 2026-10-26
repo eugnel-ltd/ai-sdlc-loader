@@ -8,10 +8,9 @@
 # owner's Mac runner. claude runs through the bundle's scripts/claude_api.sh on the Anthropic API key
 # in ~/.config/eugnel-runners/anthropic-api-key, never a subscription login (owner, 26 Oct 2026).
 #
-# Auth contract (until the slice-5 App token): the caller grants contents, issues and
-# pull-requests write and passes `secrets: audit_token`, a token with those scopes on the repo.
-# Without it the audit runs with github.token: a PR it opens starts no checks and cannot merge on
-# its own, and the step says so.
+# Auth (slice 5): the audit step asks the broker for a one-hour eugnel-ai-sdlc-gates App token for
+# this repository only (contents, issues and pull-requests write). A PR the App opens starts the
+# repo's checks, so no PAT and no caller secret is needed. Only the audit step holds the token.
 name: AI-SDLC nightly audit
 
 on:
@@ -24,10 +23,6 @@ on:
       timeout_minutes:
         type: number
         default: 90
-    secrets:
-      audit_token:
-        description: Token with contents, issues and pull-requests write on the repo; see the auth contract above
-        required: false
 
 # id-token: the broker serves the signed gate bundle only to a verified caller (#731 section 2).
 permissions:
@@ -48,7 +43,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-          token: ${{ secrets.audit_token || github.token }}
+          persist-credentials: false
       # The run's one broker fetch (#731 section 3): verify the newest unexpired signed record and
       # the archive, keep the pair for the track job, and unpack it here.
       - name: Load the signed gate bundle
@@ -88,14 +83,18 @@ jobs:
       - name: Run the audit
         id: run
         continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.audit_token || github.token }}
-          HAS_AUDIT_TOKEN: ${{ secrets.audit_token != '' }}
         run: |
           set -u
-          if [ "$HAS_AUDIT_TOKEN" != true ]; then
-            echo "::warning::no audit_token secret: the audit runs with github.token, so a PR it opens starts no checks and cannot merge on its own. Pass secrets.audit_token from the caller."
-          fi
+          python3 -I "$RUNNER_TEMP/ai-sdlc-loader/fetch_gates.py" repo-token --out "$RUNNER_TEMP/app-token" || exit 2
+          GH_TOKEN=$(cat "$RUNNER_TEMP/app-token"); rm -f "$RUNNER_TEMP/app-token"
+          echo "::add-mask::$GH_TOKEN"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          # git and gh take the App token from this step's environment only, never from .git/config.
+          # An empty first value clears any other extraheader, so git sends one Authorization.
+          export GH_TOKEN GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0=""
+          export GIT_CONFIG_KEY_1=http.https://github.com/.extraheader GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $auth"
           git config user.name "ai-sdlc nightly audit"
           git config user.email "ai-sdlc-nightly@users.noreply.github.com"
           gates=$RUNNER_TEMP/ai-sdlc-gates

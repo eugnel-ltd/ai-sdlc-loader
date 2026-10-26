@@ -96,6 +96,28 @@ class SecurityAndNightly(unittest.TestCase):
             top = text[text.index("\npermissions:\n"):text.index("\njobs:\n")]
             self.assertIn("\n  id-token: write\n", top)
 
+    def test_no_pat_and_the_app_token_only_in_the_writing_step(self):
+        # ai-sdlc #731 slice 5: no audit_token secret; the audit step alone takes an App token.
+        TAG_SYNC = (ROOT / ".github/workflows/tag-sync.yml").read_text()
+        BOT = (ROOT / ".github/workflows/bot-review.yml").read_text()
+        for text in (self.NIGHTLY, TAG_SYNC, BOT):
+            self.assertNotIn("audit_token", text)
+            self.assertNotIn("secrets.", text)
+            self.assertEqual(text.count("fetch_gates.py repo-token") + text.count('fetch_gates.py" repo-token'), 1)
+            self.assertIn('echo "::add-mask::', text)
+        for text in (self.NIGHTLY, TAG_SYNC):
+            self.assertIn("persist-credentials: false", text)
+            self.assertIn("GIT_CONFIG_COUNT=2", text)
+            self.assertIn('GIT_CONFIG_VALUE_0=""', text)
+        job = TAG_SYNC[TAG_SYNC.index("    permissions:"):TAG_SYNC.index("    steps:")]
+        self.assertIn("contents: read", job)
+        self.assertNotIn("contents: write", TAG_SYNC.replace("contents: write only", ""))
+        self.assertIn("workflow_call:", BOT)
+        top = BOT[BOT.index("\npermissions:\n"):BOT.index("\njobs:\n")]
+        self.assertNotIn("write", top.replace("id-token: write", ""))
+        self.assertIn("GH_TOKEN: ${{ github.token }}", BOT)
+        self.assertIn("export REVIEW_TOKEN", BOT)
+
     def test_cf_cost_failure_points_to_the_one_fix(self):
         self.assertIn("references/cloudflare.md#the-one-way-to-meet-the-limits-and-the-rate-limit", WORKFLOW)
 

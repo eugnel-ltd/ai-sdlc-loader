@@ -13,6 +13,7 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 | `.github/workflows/checks.yml` | The PR checks. The first job fetches the signed record and bundle once and keeps them as a run artifact. `review-on-head`, `owner-decisions`, `locked-tests` and `secret-scan` verify that pair again and run their scripts from the bundle. The written-by, manifest and Cloudflare-cost gates run the archive's prebuilt binaries (`bin/<os>-<arch>/`). No gate reads the caller's `.ai-sdlc/`. |
 | `.github/workflows/security.yml` | The weekly security scan. `security_intake.py` comes from the signed bundle. |
 | `.github/workflows/nightly-gates.yml` | The manual nightly lessons audit on the Mac runner. The prompt and `nightly_status.py` come from the signed bundle; the caller cannot supply the command. |
+| `.github/workflows/bot-review.yml` | The App's formal review of each open PR head, from the bundle's `bot_review.sh` (slice 5). |
 | `.github/workflows/tag-sync.yml` | Moves `v3` to the newest loader commit in the signed record (contract G). |
 | `.github/workflows/ai-sdlc-checks.yml` | This repo's own PR gate. It calls `checks.yml` at `main`. |
 | `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. `fetch` is the run's one broker call; `unpack` checks the saved pair again in a later job, then checks every unpacked file against `MANIFEST.sha256`. |
@@ -30,6 +31,7 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 
 - Every change is a PR from a fork into `main`. No other branch can be created here.
 - `main` needs the status `ai-sdlc/review-on-head`: an independent APPROVE from a company other than every writer's, on the PR head.
-- Only GitHub Actions can move tags. Only `tag-sync.yml` has `contents: write`.
+- Only the `eugnel-ai-sdlc-gates` App can move tags. `tag-sync.yml` gets its token from the broker (`fetch_gates.py repo-token`): one hour, this repo only, `contents: write`.
+- The nightly audit gets the same kind of token for its own repo (contents, issues and pull-requests write). No workflow here takes a PAT or a caller secret.
 
 Test: `python3 -m unittest discover -v -s tests` (needs `zstd`).
