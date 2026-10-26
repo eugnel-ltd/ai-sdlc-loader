@@ -225,11 +225,18 @@ def unpack(archive: Path, destination: Path) -> None:
                 path = PurePosixPath(member.name)
                 if path.is_absolute() or ".." in path.parts or not (member.isfile() or member.isdir()):
                     raise Refused(f"archive member is not allowed: {member.name}")
+                if member.mode & 0o6000:
+                    raise Refused(f"archive member is setuid or setgid: {member.name}")
                 total += member.size
             if total > MAX_UNPACKED:
                 raise Refused("archive unpacks over the size limit")
             destination.mkdir(parents=True, exist_ok=False)
-            bundle.extractall(destination, members=members, filter="data")
+            # The members are checked above. Python before 3.12 (and its security backports) has
+            # no extraction filter; a runner's system python3 can be that old (eugnel-website run 40358004419).
+            if hasattr(tarfile, "data_filter"):
+                bundle.extractall(destination, members=members, filter="data")
+            else:
+                bundle.extractall(destination, members=members)
 
 
 def verified_record(bundle: object, verify, now: dt.datetime) -> dict[str, object]:
