@@ -3,6 +3,9 @@
 
   fetch_gates.py bundle --verifier <dir> --out <dir>   verify, fetch and unpack the served bundle
   fetch_gates.py record --verifier <dir> --out <file>  write the newest verified record as JSON
+  fetch_gates.py fetch  --verifier <dir> --out <dir>   the run's one broker fetch: signed record and archive
+  fetch_gates.py unpack --verifier <dir> --saved <dir> --loader-sha <sha> --out <dir>
+                                                      a later job: verify the saved pair again, then unpack
 
 The broker only checks the caller's OIDC token. This script does every signature, freshness,
 digest and path check, with the pinned cosign and trusted root in <dir> (verifier/fetch_cosign.sh).
@@ -156,6 +159,11 @@ def cosign_verifies(verifier: Path, bundle: dict[str, object], digest: str) -> b
 
 def newest_record(answer: object, verify, now: dt.datetime) -> dict[str, object]:
     """The highest serial that verifies and has not expired (#731 contract B)."""
+    return newest_entry(answer, verify, now)[0]
+
+
+def newest_entry(answer: object, verify, now: dt.datetime) -> tuple[dict[str, object], object]:
+    """That record and its signed bundle."""
     entries = answer.get("records") if isinstance(answer, dict) else None
     if not isinstance(entries, list):
         raise Refused("broker answer has no record list")
@@ -170,7 +178,7 @@ def newest_record(answer: object, verify, now: dt.datetime) -> dict[str, object]
                        and subject["digest"].get("sha256") == digest for subject in subjects):
                 raise Refused("record subject is not its current archive")
             if verify(entry["object"], digest):
-                return record
+                return record, entry["object"]
         except Refused:
             continue
     raise Refused("no record verifies and is unexpired")
@@ -223,34 +231,76 @@ def unpack(archive: Path, destination: Path) -> None:
             bundle.extractall(destination, members=members, filter="data")
 
 
-def run(args: argparse.Namespace) -> int:
-    verifier = Path(args.verifier)
-    token = oidc_token()
-    answer = json.loads(broker_get(args.broker, token, "/v1/records", 10 * 1024 * 1024))
-    record = newest_record(answer, lambda bundle, digest: cosign_verifies(verifier, bundle, digest), utc_now())
-    if args.command == "record":
-        Path(args.out).write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
-        print(f"GATES-LOADER RECORD serial={record['serial']} loader_shas={','.join(record.get('loader_shas', [])) or '-'}")
-        return 0
-    route, bundle = served(record, token_claims(token))
-    body = broker_get(args.broker, token, f"/v1/archive/{bundle['archive_sha256']}", MAX_ARCHIVE)
+def verified_record(bundle: object, verify, now: dt.datetime) -> dict[str, object]:
+    """One saved record, checked again in full (#731 section 3)."""
+    record, subjects = statement(bundle)
+    check_record(record, record.get("serial"), now)
+    digest = record["current"]["archive_sha256"]
+    if not any(isinstance(subject, dict) and isinstance(subject.get("digest"), dict)
+               and subject["digest"].get("sha256") == digest for subject in subjects):
+        raise Refused("record subject is not its current archive")
+    if not verify(bundle, digest):
+        raise Refused("saved record does not verify")
+    return record
+
+
+def finish(record: dict[str, object], route: str, bundle: dict[str, object], body: bytes, out: Path) -> int:
     check_archive(body, bundle)
     with tempfile.TemporaryDirectory(prefix="gates-archive-") as temporary:
         archive = Path(temporary) / "gates.tar.zst"
         archive.write_bytes(body)
-        unpack(archive, Path(args.out))
+        unpack(archive, out)
     print(f"GATES-LOADER OK serial={record['serial']} route={route} source={bundle['source_sha']} "
           f"archive={bundle['archive_sha256']}")
     return 0
 
 
+def run(args: argparse.Namespace) -> int:
+    verifier = Path(args.verifier)
+    verify = lambda bundle, digest: cosign_verifies(verifier, bundle, digest)  # noqa: E731
+    token = oidc_token()
+    if args.command == "unpack":
+        claims = token_claims(token)
+        # A later job of the same run: no broker call, every check again (#731 section 3).
+        if claims.get("job_workflow_sha") != args.loader_sha:
+            raise Refused("this job runs another loader commit than the one that fetched")
+        saved = Path(args.saved)
+        record = verified_record(json.loads((saved / "record.json").read_text(encoding="utf-8")), verify, utc_now())
+        route, bundle = served(record, claims)
+        return finish(record, route, bundle, (saved / "gates.tar.zst").read_bytes(), Path(args.out))
+    answer = json.loads(broker_get(args.broker, token, "/v1/records", 10 * 1024 * 1024))
+    record, signed = newest_entry(answer, verify, utc_now())
+    if args.command == "record":
+        Path(args.out).write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+        print(f"GATES-LOADER RECORD serial={record['serial']} loader_shas={','.join(record.get('loader_shas', [])) or '-'}")
+        return 0
+    claims = token_claims(token)
+    route, bundle = served(record, claims)
+    body = broker_get(args.broker, token, f"/v1/archive/{bundle['archive_sha256']}", MAX_ARCHIVE)
+    if args.command == "fetch":
+        # The run's one broker fetch: keep the signed record and the archive for later jobs.
+        check_archive(body, bundle)
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=False)
+        (out / "record.json").write_text(json.dumps(signed, separators=(",", ":")), encoding="utf-8")
+        (out / "gates.tar.zst").write_bytes(body)
+        print(f"GATES-LOADER FETCHED serial={record['serial']} route={route} source={bundle['source_sha']} "
+              f"archive={bundle['archive_sha256']} loader={claims['job_workflow_sha']}")
+        return 0
+    return finish(record, route, bundle, body, Path(args.out))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("bundle", "record"))
+    parser.add_argument("command", choices=("bundle", "record", "fetch", "unpack"))
     parser.add_argument("--verifier", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--broker", default=BROKER)
+    parser.add_argument("--saved", help="unpack: the directory that fetch wrote")
+    parser.add_argument("--loader-sha", help="unpack: the loader commit that fetched")
     args = parser.parse_args(argv)
+    if args.command == "unpack" and not (args.saved and args.loader_sha):
+        parser.error("unpack needs --saved and --loader-sha")
     try:
         return run(args)
     except Refused as error:
