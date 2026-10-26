@@ -489,6 +489,15 @@ class RepoToken(unittest.TestCase):
                          ("POST", "https://ai-sdlc-gates.fol2hk.workers.dev/v1/repo-token"))
         self.assertEqual(sent[0].data, b"")
 
+    def test_both_installation_token_formats_are_accepted(self):
+        # The stateless format (GitHub, 2 Oct 2026): ghs_<app id>_<JWT>, about 520 characters.
+        stateless = "ghs_5485010_" + "eyJhbGciOiJSUzI1NiJ9" + "." + "a-b_c" * 90 + "." + "Sig-_x" * 10
+        for token in (self.TOKEN, stateless):
+            self.assertRegex(token, loader.INSTALLATION_TOKEN)
+            self.assertIsNotNone(loader.INSTALLATION_TOKEN.fullmatch(token))
+        for bad in ("ghs_short", "ghp_" + "x" * 36, "ghs_" + "x" * 36 + " y", "ghs_" + "x" * 4097):
+            self.assertIsNone(loader.INSTALLATION_TOKEN.fullmatch(bad))
+
     def test_a_refusal_or_an_odd_answer_writes_nothing(self):
         refused = loader.urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b'{"error":"forbidden"}'))
         for effect, code in ((refused, 2), (lambda *_a, **_k: self.answer({"error": "x"}), 1)):
