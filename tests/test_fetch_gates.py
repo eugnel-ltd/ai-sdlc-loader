@@ -102,6 +102,16 @@ class Served(unittest.TestCase):
         route, _ = loader.served(record(1, loader_shas=[LOADER]), claims("refs/tags/v3"))
         self.assertEqual(route, "current")
 
+    def test_every_loader_file_is_a_loader_call(self):
+        for name in ("checks", "security", "nightly-gates"):
+            call = {"job_workflow_ref": f"eugnel-ltd/ai-sdlc-loader/.github/workflows/{name}.yml@refs/tags/v3",
+                    "job_workflow_sha": LOADER}
+            self.assertEqual(loader.served(record(1, loader_shas=[LOADER]), call)[0], "current")
+        with self.assertRaises(loader.Refused):
+            loader.served(record(1, loader_shas=[LOADER]), {
+                "job_workflow_ref": "eugnel-ltd/ai-sdlc-loader/.github/workflows/tag-sync.yml@refs/tags/v3",
+                "job_workflow_sha": LOADER})
+
     def test_pin_wins_over_current(self):
         route, served = loader.served(record(1, pin=bundle(OTHER)), claims("refs/heads/main"))
         self.assertEqual((route, served["source_sha"]), ("pin", OTHER))
