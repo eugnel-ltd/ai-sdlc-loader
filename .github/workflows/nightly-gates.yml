@@ -120,7 +120,7 @@ jobs:
     name: One open issue while the audit is red
     needs: audit
     if: always()
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     timeout-minutes: 10
     # A running tracking job is never cancelled. A waiting one may be replaced by a newer run's job, which reports the newer outcome.
     concurrency:
