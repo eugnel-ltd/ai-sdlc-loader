@@ -56,6 +56,16 @@ class ChecksWorkflow(unittest.TestCase):
         self.assertEqual(WORKFLOW.count("bin=$gates/bin/$os-$arch"), 3)
 
 
+class GateRunners(unittest.TestCase):
+    def test_private_gate_jobs_run_on_small(self):
+        # ai-sdlc modules/ci.md R1: the gate jobs run only git, gh, short scripts and small native tools.
+        for name in ("checks.yml", "bot-review.yml", "nightly-gates.yml"):
+            text = (ROOT / ".github/workflows" / name).read_text()
+            self.assertNotIn('"self-hosted", "linux"', text, name)
+        checks = (ROOT / ".github/workflows/checks.yml").read_text()
+        self.assertEqual(checks.count("""fromJSON('["self-hosted", "small"]')"""), 7)
+
+
 class SecurityAndNightly(unittest.TestCase):
     SECURITY = (ROOT / ".github/workflows/security.yml").read_text()
     NIGHTLY = (ROOT / ".github/workflows/nightly-gates.yml").read_text()

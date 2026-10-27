@@ -35,7 +35,7 @@ concurrency:
 jobs:
   review:
     name: The App reviews every open PR on its head
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     timeout-minutes: 10
     steps:
       - name: Load the signed gate bundle

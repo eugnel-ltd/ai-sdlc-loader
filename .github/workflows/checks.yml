@@ -17,8 +17,9 @@
 # caller's `.ai-sdlc/`, and none falls back to another copy. Each job reads the PR as data and
 # never runs PR code.
 #
-# Runner (#731 section 7): GitHub-hosted only for a public repo, else [self-hosted, linux]. The
-# caller's runs_on is accepted and ignored.
+# Runner (#731 section 7): GitHub-hosted only for a public repo, else [self-hosted, small]: every job
+# here runs only git, gh, short scripts and the bundle's small native gate tools (ai-sdlc modules/ci.md
+# R1, `small`), so the light NAS runner can take them too. The caller's runs_on is accepted and ignored.
 name: AI-SDLC checks
 
 on:
@@ -39,7 +40,7 @@ on:
       runs_on:
         description: Ignored; the loader chooses the runner from the repo's visibility
         type: string
-        default: '["self-hosted", "linux"]'
+        default: '["self-hosted", "small"]'
 
 # id-token: every job that fetches or verifies the signed bundle mints an Actions OIDC token.
 permissions:
@@ -57,7 +58,7 @@ permissions:
 jobs:
   resolve:
     name: Resolve the PR and its head
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     timeout-minutes: 10
     outputs:
       number: ${{ steps.pr.outputs.number }}
@@ -165,7 +166,7 @@ jobs:
     name: Independent APPROVE names the head
     needs: resolve
     if: needs.resolve.outputs.is_pr == 'true'
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     timeout-minutes: 10
     # One group per PR and head: a late run for an older head can never replace or cancel a queued
     # run for the current head, and a status is only ever written to the head its group names.
@@ -244,7 +245,7 @@ jobs:
     name: owner-decisions.md is append-only
     needs: resolve
     if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -279,7 +280,7 @@ jobs:
     name: A fix leaves its failing test alone
     needs: resolve
     if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -395,7 +396,7 @@ jobs:
     name: No credentials in the PR range
     needs: resolve
     if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -468,7 +469,7 @@ jobs:
     name: product.yaml is valid and a published product has its baseline
     needs: resolve
     if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -514,7 +515,7 @@ jobs:
     name: Cloudflare config stays inside the US$5 plan
     needs: resolve
     if: needs.resolve.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "linux"]') }}
+    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
