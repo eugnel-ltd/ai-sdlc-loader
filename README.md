@@ -14,7 +14,7 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 | `.github/workflows/security.yml` | The weekly security scan. `security_intake.py` comes from the signed bundle. |
 | `.github/workflows/nightly-gates.yml` | The manual nightly lessons audit on the Mac runner. The prompt and `nightly_status.py` come from the signed bundle; the caller cannot supply the command. |
 | `.github/workflows/bot-review.yml` | The App's formal review of each open PR head, from the bundle's `bot_review.sh` (slice 5). |
-| `.github/workflows/tag-sync.yml` | Moves `v3` to the newest loader commit in the signed record (contract G). |
+| `.github/workflows/tag-sync.yml` | Moves `v3` only to the newest loader commit in a verified signed record (contract G). It runs every 15 minutes, so the tag can lag the record by one schedule interval (15 minutes). The transition window covers this lag. A delayed or failed run can extend the lag. |
 | `.github/workflows/ai-sdlc-checks.yml` | This repo's own PR gate. It calls `checks.yml` at `main`. |
 | `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. `fetch` is the run's one broker call; `unpack` checks the saved pair again in a later job, then checks every unpacked file against `MANIFEST.sha256`. |
 | `load_gates.sh` | Runs `unpack` with this loader commit's pinned verifier. |
@@ -24,6 +24,7 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 
 - `checks.yml@<40-hex sha>`: only the canary may call at the record's `candidate.loader_sha`. It gets the candidate bundle.
 - `checks.yml@v3`: the loader commit must be in the record's `loader_shas`. It gets the record's `pin`, or else `current`.
+- During a promotion, the record's `loader_shas` holds both the old and the new loader commit until `transition.until` (two hours after promotion). GitHub can resolve a run to the old `v3` commit before `tag-sync.yml` moves the tag. That run can still fetch the bundle and finish with its saved record. After the window, the next record names only the new commit. The loader refuses a new run on the old commit against that record. It checks `loader_shas`, not `transition.until` (contract E).
 - `checks.yml@main`: only this repo, for its own PRs. It gets `pin` or `current`.
 - A bundle whose source is in `revoked` is never served.
 
