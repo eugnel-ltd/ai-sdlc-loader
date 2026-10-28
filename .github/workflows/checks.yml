@@ -461,6 +461,13 @@ jobs:
             written_by_output='::error::written-by trusted input or helper unavailable
           written-by: not checked (native setup failure)'
           fi
+          # Owner decision (James, 24 Oct 2026): an unrecognised or missing author only warns.
+          if [ "$written_by_rc" -eq 1 ]; then
+            written_by_output=$(printf '%s\n' "$written_by_output" | sed 's/^::error title=Written by::/::warning title=Written by::/
+          $i\
+          ::warning title=Written by::Not blocking: an unrecognised or missing author line only warns (owner, 24 Oct 2026).')
+            written_by_rc=0
+          fi
           printf '%s\n' "$written_by_output"
           printf '%s\n' "$written_by_output" | tail -n 1 >> "$GITHUB_STEP_SUMMARY"
           exit "$written_by_rc"

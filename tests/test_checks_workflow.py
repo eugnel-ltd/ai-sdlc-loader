@@ -1,6 +1,10 @@
-"""Text checks for .github/workflows/checks.yml (the stdlib has no YAML reader)."""
+"""Text and shell checks for .github/workflows/checks.yml (no YAML reader needed)."""
 
+import os
 from pathlib import Path
+import subprocess
+import tempfile
+import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +58,58 @@ class ChecksWorkflow(unittest.TestCase):
         self.assertNotIn("setup-go", WORKFLOW)
         self.assertNotIn("go build", WORKFLOW)
         self.assertEqual(WORKFLOW.count("bin=$gates/bin/$os-$arch"), 3)
+
+    def test_written_by_unknown_only_warns_and_errors_still_fail(self):
+        step = WORKFLOW.split("      - name: Written by is filled in\n", 1)[1]
+        block = step.split("        run: |\n", 1)[1]
+        lines = []
+        for line in block.splitlines():
+            if line.strip() and not line.startswith("          "):
+                break
+            lines.append(line)
+        script = textwrap.dedent("\n".join(lines))
+
+        cases = (
+            (1, "::error title=Written by::x\nwritten-by: unknown", 0, "written-by: unknown"),
+            (0, "written-by: vendor", 0, "written-by: vendor"),
+            (2, "::error::input failure", 2, "::error::input failure"),
+            (2, "", 2, "written-by: not checked (native setup failure)"),
+            (1, "written-by: vendor", 2, "::error::written-by native result violates exit/output contract"),
+        )
+        for rc, output, expected_rc, last_line in cases:
+            with self.subTest(rc=rc, output=output), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                work = Path(directory)
+                stubs = work / "stubs"
+                stubs.mkdir()
+                git = stubs / "git"
+                git.write_text(
+                    '#!/bin/sh\ncase "$*" in\n'
+                    '  *" rev-parse "*) printf "%s\\n" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n'
+                    '  *" diff "*) printf "%s\\n" app.py ;;\n'
+                    '  *) exit 2 ;;\nesac\n'
+                )
+                git.chmod(0o755)
+                os_name = os.uname().sysname.lower()
+                arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(
+                    os.uname().machine, "unknown")
+                binary = work / "ai-sdlc-gates" / "bin" / f"{os_name}-{arch}" / "written-by"
+                binary.parent.mkdir(parents=True)
+                binary.write_text('#!/bin/sh\nprintf \'%s\\n\' "$STUB_OUTPUT"\nexit "$STUB_RC"\n')
+                binary.chmod(0o755)
+                summary = work / "summary"
+                env = {**os.environ, "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
+                       "RUNNER_TEMP": str(work), "GITHUB_STEP_SUMMARY": str(summary),
+                       "BASE": "main", "BODY": "Written by: cursor", "STUB_RC": str(rc), "STUB_OUTPUT": output}
+                result = subprocess.run(["sh", "-e", "-c", script], cwd=work, env=env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stdout.splitlines()[-1], last_line)
+                self.assertEqual(summary.read_text(), last_line + "\n")
+                if last_line == "written-by: unknown":
+                    self.assertIn("::warning title=Written by::x\n", result.stdout)
+                    self.assertIn("Not blocking: an unrecognised or missing author line only warns", result.stdout)
+                    self.assertNotIn("::error", result.stdout)
 
 
 class GateRunners(unittest.TestCase):
