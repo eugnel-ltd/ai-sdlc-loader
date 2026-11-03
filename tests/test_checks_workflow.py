@@ -1,11 +1,14 @@
 """Text and shell checks for .github/workflows/checks.yml (no YAML reader needed)."""
 
+from itertools import product
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import textwrap
 import unittest
+
+from test_bundle_gate import selector
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = (ROOT / ".github/workflows/checks.yml").read_text()
@@ -50,9 +53,11 @@ class ChecksWorkflow(unittest.TestCase):
 
     def test_native_gates_run_the_archive_binaries(self):
         # Slice 3: no gate reads the caller's copies or builds anything.
-        for call in ('"$bin/written-by" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt"',
-                     '"$bin/manifest-check" "$RUNNER_TEMP/product.yaml"',
-                     '"$bin/cf-cost-check" --head "$sha" --base "$base_sha" "$@"'):
+        for name in ("written-by", "manifest-check", "cf-cost-check"):
+            self.assertIn(f'select_gate {name} "$bin/{name}"', WORKFLOW)
+        for call in ('"${gate[@]}" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt"',
+                     '"${gate[@]}" "$RUNNER_TEMP/product.yaml"',
+                     '"${gate[@]}" --head "$sha" --base "$base_sha" "$@"'):
             self.assertIn(call, WORKFLOW)
         self.assertNotIn("$SCRIPTS", WORKFLOW)
         self.assertNotIn("setup-go", WORKFLOW)
@@ -76,8 +81,8 @@ class ChecksWorkflow(unittest.TestCase):
             (2, "", 2, "written-by: not checked (native setup failure)"),
             (1, "written-by: vendor", 2, "::error::written-by native result violates exit/output contract"),
         )
-        for rc, output, expected_rc, last_line in cases:
-            with self.subTest(rc=rc, output=output), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+        for modern, (rc, output, expected_rc, last_line) in product((False, True), cases):
+            with self.subTest(modern=modern, rc=rc, output=output), tempfile.TemporaryDirectory() as directory:
                 work = Path(directory)
                 stubs = work / "stubs"
                 stubs.mkdir()
@@ -92,15 +97,19 @@ class ChecksWorkflow(unittest.TestCase):
                 os_name = os.uname().sysname.lower()
                 arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(
                     os.uname().machine, "unknown")
-                binary = work / "ai-sdlc-gates" / "bin" / f"{os_name}-{arch}" / "written-by"
+                binary = work / "ai-sdlc-gates" / "bin" / f"{os_name}-{arch}" / ("aisdlc" if modern else "written-by")
                 binary.parent.mkdir(parents=True)
-                binary.write_text('#!/bin/sh\nprintf \'%s\\n\' "$STUB_OUTPUT"\nexit "$STUB_RC"\n')
+                binary.write_text('#!/bin/sh\n'
+                                  'if [ "$#" -eq 1 ] && [ "$1" = gate ]; then\n'
+                                  '  echo "usage: aisdlc gate <name> [args]"; exit 2\nfi\n'
+                                  'printf \'%s\\n\' "$STUB_OUTPUT"\nexit "$STUB_RC"\n')
                 binary.chmod(0o755)
                 summary = work / "summary"
-                env = {**os.environ, "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
+                env = {**os.environ, "BASH_ENV": "/dev/null", "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
                        "RUNNER_TEMP": str(work), "GITHUB_STEP_SUMMARY": str(summary),
-                       "BASE": "main", "BODY": "Written by: cursor", "STUB_RC": str(rc), "STUB_OUTPUT": output}
-                result = subprocess.run(["sh", "-e", "-c", script], cwd=work, env=env,
+                       "BASE": "main", "BODY": "Written by: cursor", "STUB_RC": str(rc), "STUB_OUTPUT": output,
+                       "BUNDLE_GATE_SELECTOR": selector(WORKFLOW)}
+                result = subprocess.run(["bash", "-e", "-c", script], cwd=work, env=env,
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
                 self.assertEqual(result.stderr, "")
@@ -127,7 +136,8 @@ class SecurityAndNightly(unittest.TestCase):
     NIGHTLY = (ROOT / ".github/workflows/nightly-gates.yml").read_text()
 
     def test_scripts_come_from_the_signed_bundle(self):
-        self.assertIn('python3 -I "$RUNNER_TEMP/ai-sdlc-gates/scripts/security_intake.py"', self.SECURITY)
+        self.assertIn('select_gate security-intake python3 -I "$gates/scripts/security_intake.py"', self.SECURITY)
+        self.assertIn('"${gate[@]}" --repo "$GITHUB_REPOSITORY" --root .', self.SECURITY)
         self.assertIn('fetch_gates.py" bundle', self.SECURITY)
         self.assertIn('"$gates/scripts/nightly_status.py"', self.NIGHTLY)
         self.assertIn('cat "$gates/references/lessons-audit.md"', self.NIGHTLY)
@@ -149,7 +159,8 @@ class SecurityAndNightly(unittest.TestCase):
 
     def test_the_audit_runs_claude_on_the_runner_api_key_only(self):
         # Owner, 26 Oct 2026: "On local you can use api". No bare claude call may use a login.
-        self.assertIn('sh "$gates/scripts/claude_api.sh" -p "$prompt"', self.NIGHTLY)
+        self.assertIn('select_gate claude-api sh "$gates/scripts/claude_api.sh"', self.NIGHTLY)
+        self.assertIn('"${gate[@]}" -p "$prompt"', self.NIGHTLY)
         self.assertNotIn("\n          claude -p", self.NIGHTLY)
 
     def test_the_caller_cannot_supply_the_audit_command(self):

@@ -11,10 +11,10 @@
 # verifies the newest unexpired signed record and the archive with the pinned verifier, and keeps
 # the pair as a run artifact. review-on-head, owner-decisions, locked-tests and secret-scan
 # download it, verify it again (load_gates.sh: same loader commit, signature, expiry, route,
-# digest, MANIFEST.sha256), unpack it into $RUNNER_TEMP and run their scripts from it (slices 1
-# and 2). The written-by, manifest and Cloudflare-cost gates run the archive's prebuilt binaries
-# for the runner's OS and architecture (slice 3), so runners build nothing. No gate reads the
-# caller's `.ai-sdlc/`, and none falls back to another copy. Each job reads the PR as data and
+# digest, MANIFEST.sha256), unpack it into $RUNNER_TEMP and run their gates from it (slices 1
+# and 2). All gates prefer the archive's bin/<os>-<arch>/aisdlc gate commands, with
+# the original scripts and native tools as fallbacks until step 8c. Runners build nothing.
+# No gate reads the caller's `.ai-sdlc/`, and none falls back to another copy. Each job reads the PR as data and
 # never runs PR code.
 #
 # Runner (#731 section 7): GitHub-hosted only for a public repo, else [self-hosted, small]: every job
@@ -54,6 +54,26 @@ permissions:
 # working tree the scripts run from. The refspec forces the update ("+"): a self-hosted runner
 # keeps refs/remotes/pr/head from the last PR it checked, and a plain fetch refuses that
 # non-fast-forward update, exits 1 and, with -q, prints nothing.
+
+# One selector shared by the gate steps; all paths are in the verified bundle.
+env:
+  BUNDLE_GATE_SELECTOR: |
+    # until step 8c: older signed bundles still need their original entry points.
+    case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
+    case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
+    aisdlc=$gates/bin/$os-$arch/aisdlc
+    if [ ! -x "$aisdlc" ] ||
+       [ "$("$aisdlc" gate 2>&1 | sed -n '1p')" != 'usage: aisdlc gate <name> [args]' ]; then
+      aisdlc=
+    fi
+    select_gate() {
+      if [ -n "$aisdlc" ]; then
+        gate=( "$aisdlc" gate "$1" )
+      else
+        shift
+        gate=( "$@" )
+      fi
+    }
 
 jobs:
   resolve:
@@ -217,7 +237,9 @@ jobs:
               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
           }
           if load_gates; then
-            if sh "$gates/scripts/review_on_head.sh" "$PR" "$HEAD" --repo "$GITHUB_REPOSITORY" > result.txt 2>&1; then code=0; else code=$?; fi
+            eval "$BUNDLE_GATE_SELECTOR"
+            select_gate review-on-head sh "$gates/scripts/review_on_head.sh"
+            if "${gate[@]}" "$PR" "$HEAD" --repo "$GITHUB_REPOSITORY" > result.txt 2>&1; then code=0; else code=$?; fi
             cat result.txt
             line=$(head -1 result.txt | cut -c1-140)
           else
@@ -274,7 +296,9 @@ jobs:
               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
           }
           load_gates || { echo "::error::the signed AI-SDLC gate bundle is unavailable: see the lines above"; exit 2; }
-          sh "$gates/scripts/owner_decisions_check.sh" "origin/$BASE" pr/head
+          eval "$BUNDLE_GATE_SELECTOR"
+          select_gate owner-decisions sh "$gates/scripts/owner_decisions_check.sh"
+          "${gate[@]}" "origin/$BASE" pr/head
 
   locked-tests:
     name: A fix leaves its failing test alone
@@ -329,9 +353,15 @@ jobs:
               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
           }
           load_gates || record_error "the signed AI-SDLC gate bundle is unavailable"
+          eval "$BUNDLE_GATE_SELECTOR"
           run_locked() {
             locked_base_arg=$(git rev-parse --verify "$2^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid base"; return 2; }
             locked_head_arg=$(git rev-parse --verify "$3^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid head"; return 2; }
+            select_gate locked-tests python3 "$5"
+            if [ "${gate[1]}" = gate ]; then
+              "${gate[@]}" --base "$locked_base_arg" --head "$locked_head_arg" --test-paths "$test_paths"
+              return $?
+            fi
             if [ -f "$4" ]; then
               cp "$4" "$5" || { echo "LOCKED-TESTS RECORD ERROR: helper read failed"; return 2; }
               locked_help=$(python3 "$5" --help 2>&1) || { printf '%s\n' "$locked_help"; echo "LOCKED-TESTS RECORD ERROR: helper interface failed"; return 2; }
@@ -425,7 +455,9 @@ jobs:
               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
           }
           load_gates || { echo "::error::the signed AI-SDLC gate bundle is unavailable: see the lines above"; exit 2; }
-          sh "$gates/scripts/secret_scan.sh" "origin/$BASE" pr/head
+          eval "$BUNDLE_GATE_SELECTOR"
+          select_gate secret-scan sh "$gates/scripts/secret_scan.sh"
+          "${gate[@]}" "origin/$BASE" pr/head
 
       - name: Written by is filled in
         if: github.event_name == 'pull_request_target' || github.event_name == 'pull_request'
@@ -443,14 +475,16 @@ jobs:
           written_by_rc=0 written_by_output=
           base_sha=$(git --no-replace-objects rev-parse --verify "origin/$BASE^{commit}") || written_by_rc=2
           sha=$(git --no-replace-objects rev-parse --verify 'pr/head^{commit}') || written_by_rc=2
-          [ -x "$bin/written-by" ] || written_by_rc=2
+          eval "$BUNDLE_GATE_SELECTOR"
+          select_gate written-by "$bin/written-by"
+          [ -x "${gate[0]}" ] || written_by_rc=2
           if [ "$written_by_rc" -eq 0 ]; then
             printf '%s\n' "$BODY" > "$RUNNER_TEMP/pr-body.txt" \
               && git --no-replace-objects -c core.quotePath=false diff --no-renames --name-only "$base_sha...$sha" > "$RUNNER_TEMP/pr-files.txt" \
               || written_by_rc=2
           fi
           if [ "$written_by_rc" -eq 0 ]; then
-            written_by_output=$("$bin/written-by" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt" 2>&1) || written_by_rc=$?
+            written_by_output=$("${gate[@]}" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt" 2>&1) || written_by_rc=$?
             # The native exit and last-line contract (ai-sdlc scripts/written_by_native.sh).
             case "$written_by_rc:$(printf '%s\n' "$written_by_output" | tail -n 1)" in
               '0:written-by: native'|'0:written-by: vendor'|'0:written-by: design'|'0:written-by: lane-failed'|'0:written-by: claude'|'0:written-by: docs only'|'0:written-by: operational data only'|'1:written-by: unknown'|2:*) ;;
@@ -515,8 +549,10 @@ jobs:
           case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
           case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
           bin=$gates/bin/$os-$arch
-          [ -x "$bin/manifest-check" ] || { echo "MANIFEST ERROR: trusted manifest bundle unavailable"; exit 2; }
-          "$bin/manifest-check" "$RUNNER_TEMP/product.yaml"
+          eval "$BUNDLE_GATE_SELECTOR"
+          select_gate manifest-check "$bin/manifest-check"
+          [ -x "${gate[0]}" ] || { echo "MANIFEST ERROR: trusted manifest bundle unavailable"; exit 2; }
+          "${gate[@]}" "$RUNNER_TEMP/product.yaml"
 
   cloudflare-cost:
     name: Cloudflare config stays inside the US$5 plan
@@ -557,13 +593,15 @@ jobs:
           case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
           case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
           bin=$gates/bin/$os-$arch
-          [ -x "$bin/cf-cost-check" ] || { echo "CF-COST: input error: trusted native bundle unavailable"; exit 2; }
+          eval "$BUNDLE_GATE_SELECTOR"
+          select_gate cf-cost-check "$bin/cf-cost-check"
+          [ -x "${gate[0]}" ] || { echo "CF-COST: input error: trusted native bundle unavailable"; exit 2; }
           # The base's owner decisions may allow a paid feature; the PR's own copy never counts.
           set --
           if git --no-replace-objects show "$base_sha:docs/owner-decisions.md" > "$RUNNER_TEMP/owner-decisions.md" 2>/dev/null; then
             set -- --decisions "$RUNNER_TEMP/owner-decisions.md"
           fi
-          rc=0; "$bin/cf-cost-check" --head "$sha" --base "$base_sha" "$@" || rc=$?
+          rc=0; "${gate[@]}" --head "$sha" --base "$base_sha" "$@" || rc=$?
           # The one documented fix for every finding (ai-sdlc #731): measure, set limits, rate-limit per IP.
           [ "$rc" -ne 1 ] || echo "::error::How to fix: https://github.com/eugnel-ltd/ai-sdlc/blob/main/references/cloudflare.md#the-one-way-to-meet-the-limits-and-the-rate-limit"
           exit "$rc"

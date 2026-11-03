@@ -40,6 +40,26 @@ concurrency:
   group: ai-sdlc-security-${{ github.repository }}
   cancel-in-progress: false
 
+# One selector shared by the gate steps; all paths are in the verified bundle.
+env:
+  BUNDLE_GATE_SELECTOR: |
+    # until step 8c: older signed bundles still need their original entry points.
+    case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
+    case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
+    aisdlc=$gates/bin/$os-$arch/aisdlc
+    if [ ! -x "$aisdlc" ] ||
+       [ "$("$aisdlc" gate 2>&1 | sed -n '1p')" != 'usage: aisdlc gate <name> [args]' ]; then
+      aisdlc=
+    fi
+    select_gate() {
+      if [ -n "$aisdlc" ]; then
+        gate=( "$aisdlc" gate "$1" )
+      else
+        shift
+        gate=( "$@" )
+      fi
+    }
+
 jobs:
   scan:
     name: Secrets, dependencies and static analysis
@@ -125,5 +145,8 @@ jobs:
             --description "Found by the weekly AI-SDLC security scan" --force
           for l in intent security; do gh label create "$l" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true; done
           out=$RUNNER_TEMP/sec
-          python3 -I "$RUNNER_TEMP/ai-sdlc-gates/scripts/security_intake.py" --repo "$GITHUB_REPOSITORY" --root . \
+          gates=$RUNNER_TEMP/ai-sdlc-gates
+          eval "$BUNDLE_GATE_SELECTOR"
+          select_gate security-intake python3 -I "$gates/scripts/security_intake.py"
+          "${gate[@]}" --repo "$GITHUB_REPOSITORY" --root . \
             --gitleaks "$out/gitleaks.json" --osv "$out/osv.json" --semgrep "$out/semgrep.json" --file
