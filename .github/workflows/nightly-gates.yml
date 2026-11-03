@@ -2,10 +2,10 @@
 #
 # Reusable workflow. A repo calls it from `.github/workflows/ai-sdlc-nightly.yml` on main, on
 # schedule or workflow_dispatch, with `permissions: id-token: write` besides the write scopes below.
-# The audit prompt (references/lessons-audit.md) and nightly_status.py come from the signed gate
+# The audit prompt (references/lessons-audit.md) and the audit/status gates come from the signed gate
 # bundle; the caller's `.ai-sdlc/` is not read, and the caller cannot supply the command (#731
 # section 6). The scheduled audit runs from a Claude cloud session; this is the manual run on the
-# owner's Mac runner. claude runs through the bundle's scripts/claude_api.sh on the Anthropic API key
+# owner's Mac runner. claude runs through the bundle's claude-api gate (or its legacy script) on the API key
 # in ~/.config/eugnel-runners/anthropic-api-key, never a subscription login (owner, 26 Oct 2026).
 #
 # Auth (slice 5): the audit step asks the broker for a one-hour eugnel-ai-sdlc-gates App token for
@@ -30,6 +30,26 @@ permissions:
   issues: write
   pull-requests: write
   id-token: write
+
+# One selector shared by the gate steps; all paths are in the verified bundle.
+env:
+  BUNDLE_GATE_SELECTOR: |
+    # until step 8c: older signed bundles still need their original entry points.
+    case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
+    case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
+    aisdlc=$gates/bin/$os-$arch/aisdlc
+    if [ ! -x "$aisdlc" ] ||
+       [ "$("$aisdlc" gate 2>&1 | sed -n '1p')" != 'usage: aisdlc gate <name> [args]' ]; then
+      aisdlc=
+    fi
+    select_gate() {
+      if [ -n "$aisdlc" ]; then
+        gate=( "$aisdlc" gate "$1" )
+      else
+        shift
+        gate=( "$@" )
+      fi
+    }
 
 jobs:
   audit:
@@ -98,13 +118,18 @@ jobs:
           git config user.name "ai-sdlc nightly audit"
           git config user.email "ai-sdlc-nightly@users.noreply.github.com"
           gates=$RUNNER_TEMP/ai-sdlc-gates
+          eval "$BUNDLE_GATE_SELECTOR"
+          select_gate bookmark python3 "$gates/scripts/bookmark.py"
+          printf -v bookmark_command '%q ' "${gate[@]}"
+          bookmark_command=${bookmark_command% }
           # The skill's files for this run are the verified bundle, not the runner's installed copy.
-          prompt=$(printf 'Runtime note: the AI-SDLC skill files for this run are the signed gate bundle in %s. Wherever this prompt names ~/.claude/skills/ai-sdlc/, use %s/ instead.\n\n' "$gates" "$gates"; cat "$gates/references/lessons-audit.md")
+          prompt=$(printf 'Runtime note: the AI-SDLC skill files for this run are the signed gate bundle in %s. Wherever this prompt names ~/.claude/skills/ai-sdlc/, use %s/ instead. For bookmark operations use %s with the same arguments.\n\n' "$gates" "$gates" "$bookmark_command"; cat "$gates/references/lessons-audit.md")
           # The runner's shell has errexit on, so the status is captured in a conditional; else a red
           # audit ends the step here and its log tail never reaches the run log.
           code=0
-          sh "$gates/scripts/claude_api.sh" -p "$prompt" --permission-mode acceptEdits \
-            --allowedTools "Bash(git:*) Bash(gh:*) Bash(date:*) Bash(python3 $gates/scripts/bookmark.py:*) Read Edit Write Grep Glob" \
+          select_gate claude-api sh "$gates/scripts/claude_api.sh"
+          "${gate[@]}" -p "$prompt" --permission-mode acceptEdits \
+            --allowedTools "Bash(git:*) Bash(gh:*) Bash(date:*) Bash($bookmark_command:*) Read Edit Write Grep Glob" \
             > audit.log 2>&1 || code=$?
           tail -c 20000 audit.log
           echo "exit=$code"
@@ -153,10 +178,12 @@ jobs:
               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
           }
           if load_gates; then
+            eval "$BUNDLE_GATE_SELECTOR"
+            select_gate nightly-status python3 -I "$gates/scripts/nightly_status.py"
             if [ "$OUTCOME" != success ]; then
-              python3 -I "$gates/scripts/nightly_status.py" --repo "$GITHUB_REPOSITORY" red --runner "workflow run #$RUN_NUMBER" --cause "the audit step failed: $RUN_URL"
+              "${gate[@]}" --repo "$GITHUB_REPOSITORY" red --runner "workflow run #$RUN_NUMBER" --cause "the audit step failed: $RUN_URL"
             else
-              python3 -I "$gates/scripts/nightly_status.py" --repo "$GITHUB_REPOSITORY" green --result "Workflow run #$RUN_NUMBER passed: $RUN_URL"
+              "${gate[@]}" --repo "$GITHUB_REPOSITORY" green --result "Workflow run #$RUN_NUMBER passed: $RUN_URL"
             fi
             exit $?
           fi
