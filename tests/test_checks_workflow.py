@@ -342,7 +342,8 @@ esac
         for reads, states, rc in (("approve", ["success"], 0),
                                   ("wait approve", ["pending", "success"], 0),
                                   ("approve wait", ["success", "pending"], 0),
-                                  ("wait approve wait approve wait approve", ["pending", "success", "pending", "success", "pending"], 2)):
+                                  ("wait approve wait approve wait approve", ["pending", "success", "pending", "success", "pending", "error"], 2),
+                                  ("approve wait approve wait approve wait", ["success", "pending", "success", "pending", "success", "error"], 2)):
             with self.subTest(reads=reads):
                 (self.work / "reads").unlink(missing_ok=True)
                 result, statuses = self.run_gate("review-on-head", READS=reads)

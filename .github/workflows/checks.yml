@@ -266,7 +266,13 @@ jobs:
             evaluate > /dev/null
             [ "$state:$line" != "$written" ] || break
             echo "::notice::the review result changed while publishing; writing it again"
-            [ "$attempt" -lt 5 ] || { echo "::error::the review result kept changing on $HEAD"; exit 2; }
+            if [ "$attempt" -eq 5 ]; then
+              # Never leave a result this run no longer agrees with: hold the merge with error.
+              echo "::error::the review result kept changing on $HEAD"
+              state=error; line="review result kept changing; re-run this check"
+              publish || echo "::error::could not write the status ai-sdlc/review-on-head on $HEAD"
+              exit 2
+            fi
           done
           # The status holds the merge, not this job (#622).
           [ "$code" -ne 1 ] || code=0
