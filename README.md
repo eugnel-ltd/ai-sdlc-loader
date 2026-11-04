@@ -10,19 +10,30 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 
 | File | What it does |
 |---|---|
-| `.github/workflows/checks.yml` | The PR checks. The first job fetches the signed record and bundle once and keeps them as a run artifact. `review-on-head`, `owner-decisions`, `locked-tests` and `secret-scan` verify that pair again. These and the written-by, manifest and Cloudflare-cost gates prefer `bin/<os>-<arch>/aisdlc gate <name>` from that bundle. No gate reads the caller's `.ai-sdlc/`. |
+| `.github/workflows/checks.yml` | One PR-check job resolves the head, fetches the signed record and bundle once, verifies and unpacks the saved pair once, and checks out once. It runs review-on-head, owner-decisions, locked-tests, secret-scan (including written-by), manifest and Cloudflare-cost in that order, then removes the temporary bundle. The gates prefer `bin/<os>-<arch>/aisdlc gate <name>` from that bundle. No gate reads the caller's `.ai-sdlc/`. |
 | `.github/workflows/security.yml` | The weekly security scan. Runs the signed bundle's `aisdlc gate security-intake`. |
 | `.github/workflows/nightly-gates.yml` | The manual nightly lessons audit on the Mac runner. The prompt and the `claude-api`, `bookmark` and `nightly-status` gates come from the signed bundle; the caller cannot supply the command. |
 | `.github/workflows/bot-review.yml` | The App's formal review of each open PR head, from the bundle's `aisdlc gate bot-review`. |
 | `.github/workflows/tag-sync.yml` | Moves `v3` only to the newest loader commit in a verified signed record (contract G). It runs every 15 minutes, so the tag can lag the record by one schedule interval (15 minutes). The transition window covers this lag. A delayed or failed run can extend the lag. |
 | `.github/workflows/ai-sdlc-checks.yml` | This repo's own PR gate. It calls `checks.yml` at `main`. |
-| `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. `fetch` is the run's one broker call; `unpack` checks the saved pair again in a later job, then checks every unpacked file against `MANIFEST.sha256`. |
+| `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. `fetch` is the run's one broker call; `unpack` checks the saved pair again, then checks every unpacked file against `MANIFEST.sha256`. |
 | `load_gates.sh` | Runs `unpack` with this loader commit's pinned verifier. |
 | `verifier/` | A byte copy of ai-sdlc `gates/verifier/` (contract C). Change both together in reviewed PRs. |
 
 Each of the four gate workflows has one shared `select_gate` shell function. It uses the bundle's executable `bin/<os>-<arch>/aisdlc` only when that gate's help or harmless usage path identifies it. Until step 8c, a missing binary or gate selects the original bundle script (with its original interpreter and flags) or native tool. A gate failure is returned unchanged; it never triggers a second attempt through the fallback. The nightly bookmark command is selected in both the prompt and `--allowedTools`.
 
 Locked-tests runs the verified bundle binary, when available, against the pinned PR target and head. Its fallback still copies the bundle's Python helper to `$RUNNER_TEMP` before running it; PR code supplies neither helper. The written-by exit/output contract and the owner's warning-only treatment of an unknown author are unchanged.
+
+The checks job publishes six commit statuses with the caller's former check-run contexts:
+
+- `checks / Independent APPROVE names the head`
+- `checks / owner-decisions.md is append-only`
+- `checks / A fix leaves its failing test alone`
+- `checks / No credentials in the PR range`
+- `checks / product.yaml is valid and a published product has its baseline`
+- `checks / Cloudflare config stays inside the US$5 plan`
+
+Each status targets the resolved PR head and links to the workflow run. Gates continue after earlier failures, and a failed fetch or unpack makes every applicable gate fail closed, even on a non-fix branch or without product.yaml. The job fails if any gate or status write fails. Review-comment events still run only review-on-head. The existing `ai-sdlc/review-on-head` status keeps its pending, failure and closed-PR rules; a missing approval now also fails the summary and replacement context. Status writes are serialised per PR rather than per resolved head, because job concurrency cannot use steps from that same job. The job has a 70-minute limit covering setup and all six former 10-minute gate limits.
 
 ## Which bundle a call gets
 

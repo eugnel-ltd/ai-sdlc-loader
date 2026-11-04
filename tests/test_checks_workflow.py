@@ -2,20 +2,20 @@
 
 from itertools import product
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
 import textwrap
 import unittest
 
-from test_bundle_gate import selector
+from test_bundle_gate import executable, selector, step
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = (ROOT / ".github/workflows/checks.yml").read_text()
 
-# ai-sdlc #731 section 8: job ids and names stay byte for byte.
-JOBS = {
-    "resolve": "Resolve the PR and its head",
+# The replacement commit statuses retain the caller's exact former check-run names.
+GATES = {
     "review-on-head": "Independent APPROVE names the head",
     "owner-decisions": "owner-decisions.md is append-only",
     "locked-tests": "A fix leaves its failing test alone",
@@ -25,11 +25,60 @@ JOBS = {
 }
 
 
+def gate_block(name):
+    return WORKFLOW.split(f"      - name: {name}\n", 1)[1].split("      - name: ", 1)[0]
+
+
+def status_publisher():
+    return textwrap.dedent(WORKFLOW.split("  GATE_STATUS: |\n", 1)[1].split("  BUNDLE_GATE_SELECTOR:", 1)[0])
+
+
 class ChecksWorkflow(unittest.TestCase):
-    def test_job_ids_and_names_are_unchanged(self):
-        for job, name in JOBS.items():
-            self.assertIn(f"\n  {job}:\n    name: {name}\n", WORKFLOW)
+    def test_one_job_and_six_gate_steps_with_exact_contexts(self):
+        jobs = WORKFLOW.split("\njobs:\n", 1)[1]
+        self.assertEqual(re.findall(r"^  ([a-z-]+):$", jobs, re.M), ["checks"])
+        self.assertNotIn("needs:", jobs)
+        contexts = re.findall(r"^          STATUS_CONTEXT: (.*)$", jobs, re.M)
+        self.assertEqual(contexts, ["checks / " + name for name in GATES.values()])
+        self.assertEqual(WORKFLOW.count("uses: actions/checkout@"), 1)
         self.assertIn("context=ai-sdlc/review-on-head", WORKFLOW)
+        self.assertIn("timeout-minutes: 70", jobs)
+        self.assertIn("cancel-in-progress: false", jobs)
+        self.assertNotIn("needs.resolve", jobs)
+
+    def test_gates_continue_after_failure_and_keep_event_guards(self):
+        for gate, name in GATES.items():
+            block = gate_block(name)
+            condition = "if: always() && steps.pr.outputs.is_pr == 'true'"
+            if gate != "review-on-head":
+                condition += " && github.event_name != 'issue_comment'"
+            self.assertIn(condition + "\n", block)
+            # Failures must still fail the single check run; only the fetch is tolerated.
+            self.assertNotIn("continue-on-error:", block)
+            self.assertIn('eval "$GATE_STATUS"', block)
+            self.assertIn("GH_TOKEN: ${{ github.token }}", block)
+            self.assertIn("HEAD: ${{ steps.pr.outputs.head }}", block)
+            self.assertIn("steps.gates.outcome == 'success' && steps.bundle.outcome == 'success'", block)
+            self.assertIn("steps.checkout.outcome == 'success'", block)
+
+    def test_caller_contract_and_identity_checks_remain(self):
+        self.assertIn("name: AI-SDLC checks\n\non:\n  workflow_call:", WORKFLOW)
+        for item in ("base", "scripts_dir", "test_paths", "runs_on"):
+            self.assertIn(f"      {item}:\n", WORKFLOW)
+        for permission in ("contents: read", "pull-requests: read", "issues: read",
+                           "statuses: write", "id-token: write"):
+            self.assertIn("  " + permission + "\n", WORKFLOW)
+        for check in ('[ "$number" = "$requested" ] && [ -z "$surplus" ]',
+                      'full_sha "$head" && full_sha "$target_base_sha"',
+                      'git check-ref-format "refs/heads/$branch"',
+                      'git check-ref-format "refs/heads/$target_base_ref"',
+                      '[ "$base_repo" = "$GITHUB_REPOSITORY" ]',
+                      '[ "$head" = "$PR_HEAD" ] && [ "$branch" = "$PR_BRANCH" ]',
+                      '[ "$target_base_ref" = "$PR_BASE_REF" ] && [ "$base_repo" = "$PR_BASE_REPO" ]',
+                      'full_sha "$HEAD_SHA" && full_sha "$TARGET_BASE_SHA"',
+                      '[ "$target" = "$TARGET_BASE_SHA" ] && [ "$fetched_head" = "$HEAD_SHA" ]'):
+            self.assertIn(check, WORKFLOW)
+        self.assertIn('"$TARGET_BASE_SHA" "+refs/pull/$PR/head:refs/remotes/pr/head"', WORKFLOW)
 
     def test_every_job_may_mint_an_oidc_token(self):
         # A called workflow's permissions block sets id-token to none when it leaves it out.
@@ -41,15 +90,22 @@ class ChecksWorkflow(unittest.TestCase):
     def test_one_broker_fetch_per_run(self):
         self.assertEqual(WORKFLOW.count('fetch_gates.py" fetch '), 1)
         self.assertNotIn('fetch_gates.py" bundle', WORKFLOW)
-        self.assertEqual(WORKFLOW.count("uses: actions/upload-artifact@"), 1)
+        self.assertNotIn("actions/upload-artifact@", WORKFLOW)
+        self.assertNotIn("actions/download-artifact@", WORKFLOW)
+        self.assertEqual(WORKFLOW.count('fetch_gates.py" unpack '), 1)
+        self.assertEqual(WORKFLOW.count('sh "$loader/verifier/fetch_cosign.sh"'), 1)
+        self.assertIn('--loader-sha "$LOADER_SHA" --out "$RUNNER_TEMP/ai-sdlc-gates"', WORKFLOW)
+        cleanup = WORKFLOW.split("      - name: Clean up the gate bundle and temporary inputs\n", 1)[1]
+        self.assertIn("if: always()", cleanup)
+        for directory in ("ai-sdlc-fetch", "ai-sdlc-gates", "ai-sdlc-loader", "ai-sdlc-verifier"):
+            self.assertIn(f'"$RUNNER_TEMP/{directory}"', cleanup)
 
     def test_shell_gates_run_from_the_signed_bundle(self):
         # Slice 2: these gates no longer read the caller's vendored copies.
         for script in ("review_on_head.sh", "owner_decisions_check.sh", "secret_scan.sh", "locked_tests_check.py"):
             self.assertIn(f'"$gates/scripts/{script}"', WORKFLOW)
             self.assertNotIn(f"$SCRIPTS/{script}", WORKFLOW)
-        self.assertEqual(WORKFLOW.count("uses: actions/download-artifact@"), 6)
-        self.assertEqual(WORKFLOW.count('sh "$loader/load_gates.sh"'), 6)
+        self.assertNotIn('sh "$loader/load_gates.sh"', WORKFLOW)
 
     def test_native_gates_run_the_archive_binaries(self):
         # Slice 3: no gate reads the caller's copies or builds anything.
@@ -65,14 +121,9 @@ class ChecksWorkflow(unittest.TestCase):
         self.assertEqual(WORKFLOW.count("bin=$gates/bin/$os-$arch"), 3)
 
     def test_written_by_unknown_only_warns_and_errors_still_fail(self):
-        step = WORKFLOW.split("      - name: Written by is filled in\n", 1)[1]
-        block = step.split("        run: |\n", 1)[1]
-        lines = []
-        for line in block.splitlines():
-            if line.strip() and not line.startswith("          "):
-                break
-            lines.append(line)
-        script = textwrap.dedent("\n".join(lines))
+        # The original written-by shell now follows the scan in its combined gate step.
+        script = step(WORKFLOW, GATES["secret-scan"])
+        script = script.split("# Written-by ran after a successful scan in the former secret-scan job.\n", 1)[1]
 
         cases = (
             (1, "::error title=Written by::x\nwritten-by: unknown", 0, "written-by: unknown"),
@@ -121,6 +172,146 @@ class ChecksWorkflow(unittest.TestCase):
                     self.assertNotIn("::error", result.stdout)
 
 
+class GateExecution(unittest.TestCase):
+    """Execute the real step bodies; stub only GitHub, git data and the signed tools."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.work = Path(self.temporary.name)
+        stubs = self.work / "stubs"
+        executable(stubs / "gh", '''if [ "$2" != -X ]; then
+  echo "${PR_STATE:-open}"; exit 0
+fi
+printf '%s\\0' "$@" >> "$STATUS_LOG"
+printf '\\n' >> "$STATUS_LOG"
+exit "${POST_RC:-0}"
+''')
+        executable(stubs / "git", '''case "$*" in
+  *fetch*) exit "${FETCH_RC:-0}" ;;
+  *rev-parse*)
+    case "$*" in
+      *"$TARGET_BASE_SHA"*) echo "$TARGET_BASE_SHA" ;;
+      *) echo "${FETCHED_HEAD:-$HEAD}" ;;
+    esac ;;
+  *ls-tree*)
+    [ "${NO_PRODUCT:-false}" = true ] || echo "100644 blob $HEAD product.yaml" ;;
+  *show*) echo 'trusted data' ;;
+  *diff*) echo app.py ;;
+  *) exit 2 ;;
+esac
+''')
+        executable(stubs / "uname", 'case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n')
+        executable(self.work / "ai-sdlc-gates/bin/linux-amd64/aisdlc", '''if [ "$#" -eq 1 ] && [ "$1" = gate ]; then
+  echo 'usage: aisdlc gate <name> [args]'; exit 2
+fi
+printf '%s\\n' "$2" >> "$TOOL_LOG"
+if [ "$2" = written-by ]; then
+  echo "${WRITTEN_OUTPUT:-written-by: vendor}"; exit "${WRITTEN_RC:-0}"
+fi
+echo "${TOOL_OUTPUT:-gate result}"
+exit "$TOOL_RC"
+''')
+        self.env = {
+            **os.environ, "BASH_ENV": "/dev/null", "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
+            "RUNNER_TEMP": str(self.work), "GITHUB_REPOSITORY": "example/product", "GH_TOKEN": "github-token",
+            "GITHUB_STEP_SUMMARY": str(self.work / "summary"), "GATE_STATUS": status_publisher(),
+            "BUNDLE_GATE_SELECTOR": selector(WORKFLOW), "BUNDLE_READY": "true", "CHECKOUT_READY": "true",
+            "STATUS_LOG": str(self.work / "statuses"), "TOOL_LOG": str(self.work / "tools"),
+            "HEAD": "a" * 40, "HEAD_SHA": "a" * 40, "TARGET_BASE_SHA": "b" * 40,
+            "BASE": "main", "PR": "42", "BRANCH": "fix/example", "TEST_PATHS": "tests/",
+            "EVENT": "pull_request_target", "BODY": "Written by: vendor",
+            "RUN_URL": "https://github.com/example/product/actions/runs/123", "TOOL_RC": "0",
+        }
+
+    def run_gate(self, gate, **env):
+        (self.work / "statuses").unlink(missing_ok=True)
+        (self.work / "tools").unlink(missing_ok=True)
+        result = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step(WORKFLOW, GATES[gate])],
+            cwd=self.work, env={**self.env, "STATUS_CONTEXT": "checks / " + GATES[gate], **env},
+            capture_output=True, text=True, timeout=10)
+        statuses = []
+        for row in (self.work / "statuses").read_text().splitlines():
+            args = row.rstrip("\0").split("\0")
+            self.assertEqual(args[:4], ["api", "-X", "POST", "repos/example/product/statuses/" + "a" * 40])
+            fields = dict(arg.split("=", 1) for arg in args[4:] if arg != "-f")
+            self.assertEqual(fields["target_url"], self.env["RUN_URL"])
+            self.assertLessEqual(len(fields["description"]), 140)
+            statuses.append(fields)
+        return result, statuses
+
+    def test_each_step_publishes_its_exit_result_and_fails_the_summary(self):
+        for gate, rc in product(GATES, (0, 1, 2, 17)):
+            with self.subTest(gate=gate, rc=rc):
+                result, statuses = self.run_gate(gate, TOOL_RC=str(rc))
+                self.assertEqual(result.returncode, rc, result.stdout + result.stderr)
+                self.assertEqual(statuses[-1]["context"], "checks / " + GATES[gate])
+                self.assertEqual(statuses[-1]["state"], {0: "success", 1: "failure"}.get(rc, "error"))
+
+    def test_failed_fetch_unpack_or_checkout_fails_all_steps_closed_even_with_stale_tools(self):
+        # False readiness also covers a fetch failure followed by a skipped unpack. Tools
+        # deliberately remain on disk, so an old self-hosted bundle must never be selected.
+        for gate, failure in product(GATES, ("BUNDLE_READY", "CHECKOUT_READY")):
+            with self.subTest(gate=gate, failure=failure):
+                result, statuses = self.run_gate(gate, **{failure: "false", "BRANCH": "feature/example", "NO_PRODUCT": "true"})
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(statuses[-1]["state"], "error")
+                self.assertFalse((self.work / "tools").exists())
+                if gate == "review-on-head":
+                    self.assertEqual(statuses[0]["context"], "ai-sdlc/review-on-head")
+                    self.assertEqual(statuses[0]["state"], "error")
+
+    def test_legacy_review_status_pending_failure_and_closed_pr_are_preserved(self):
+        for output, legacy_state in (("REVIEW-ON-HEAD FAIL: no review names this head", "pending"),
+                                     ("REVIEW-ON-HEAD FAIL: rejected", "failure")):
+            result, statuses = self.run_gate("review-on-head", TOOL_RC="1", TOOL_OUTPUT=output)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(statuses[0]["state"], legacy_state)
+            self.assertEqual(statuses[0]["context"], "ai-sdlc/review-on-head")
+            self.assertEqual(statuses[0]["description"], output)
+            self.assertEqual(statuses[1]["state"], "failure")
+        for ready in ("true", "false"):
+            result, statuses = self.run_gate("review-on-head", PR_STATE="closed", BUNDLE_READY=ready)
+            self.assertEqual(result.returncode, 0 if ready == "true" else 2)
+            self.assertEqual(len(statuses), 1)
+            self.assertEqual(statuses[0]["context"], "checks / " + GATES["review-on-head"])
+            self.assertFalse((self.work / "tools").exists())
+
+    def test_failed_status_write_fails_every_gate(self):
+        for gate in GATES:
+            with self.subTest(gate=gate):
+                result, _ = self.run_gate(gate, POST_RC="1")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("could not write the status", result.stdout)
+
+    def test_written_by_failures_and_warning_feed_the_secret_scan_status(self):
+        for rc, output, expected in ((1, "written-by: unknown", 0), (2, "input error", 2),
+                                     (1, "written-by: vendor", 2)):
+            result, statuses = self.run_gate("secret-scan", WRITTEN_RC=str(rc), WRITTEN_OUTPUT=output)
+            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            self.assertEqual(statuses[-1]["state"], "success" if expected == 0 else "error")
+        result, _ = self.run_gate("secret-scan", TOOL_RC="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual((self.work / "tools").read_text(), "secret-scan\n")
+
+    def test_locked_tests_still_refuses_a_changed_pr_identity(self):
+        result, statuses = self.run_gate("locked-tests", FETCHED_HEAD="c" * 40)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("fetched PR identity mismatch", result.stdout)
+        self.assertEqual(statuses[-1]["state"], "error")
+        self.assertFalse((self.work / "tools").exists())
+
+    def test_cleanup_removes_the_bundle_after_failures(self):
+        for directory in ("ai-sdlc-fetch", "ai-sdlc-loader", "ai-sdlc-verifier"):
+            (self.work / directory).mkdir()
+        result = subprocess.run(["bash", "-e", "-c", step(WORKFLOW, "Clean up the gate bundle and temporary inputs")],
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for directory in ("ai-sdlc-fetch", "ai-sdlc-gates", "ai-sdlc-loader", "ai-sdlc-verifier"):
+            self.assertFalse((self.work / directory).exists())
+
+
 class GateRunners(unittest.TestCase):
     def test_private_gate_jobs_run_on_small(self):
         # ai-sdlc modules/ci.md R1: the gate jobs run only git, gh, short scripts and small native tools.
@@ -128,7 +319,7 @@ class GateRunners(unittest.TestCase):
             text = (ROOT / ".github/workflows" / name).read_text()
             self.assertNotIn('"self-hosted", "linux"', text, name)
         checks = (ROOT / ".github/workflows/checks.yml").read_text()
-        self.assertEqual(checks.count("""fromJSON('["self-hosted", "small"]')"""), 7)
+        self.assertEqual(checks.count("""fromJSON('["self-hosted", "small"]')"""), 1)
 
 
 class SecurityAndNightly(unittest.TestCase):
