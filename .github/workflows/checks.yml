@@ -89,7 +89,11 @@ env:
 
 jobs:
   checks:
-    name: AI-SDLC gates
+    # The job keeps the review job's former check-run name. ai-sdlc's head checks skip that name
+    # (the review_job column of config/auto-merge-repos.tsv), so a queued run that a review-comment
+    # run replaces leaves no cancelled check that would hold the merge. The six results are held
+    # by their commit statuses, which the head checks require.
+    name: Independent APPROVE names the head
     if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
     runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     # Ten minutes for setup and cleanup, plus six sequential ten-minute gate limits.

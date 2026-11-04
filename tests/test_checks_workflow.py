@@ -45,7 +45,9 @@ class ChecksWorkflow(unittest.TestCase):
         # ai-sdlc #483: one runner job per event; review runs first, then the five gates.
         self.assertEqual(list(JOBS), ["checks"])
         job = JOBS["checks"]
-        self.assertIn("    name: AI-SDLC gates\n", job)
+        # The review job's former check-run name, which ai-sdlc's head checks skip, so a replaced
+        # queued run leaves no cancelled check that holds the merge (codex review of 2be1f64).
+        self.assertIn("    name: Independent APPROVE names the head\n", job)
         self.assertNotIn("needs:", job)
         self.assertEqual(job.count("uses: actions/checkout@"), 1)
         contexts = re.findall(r"^          STATUS_CONTEXT: (.*)$", job, re.M)
@@ -318,6 +320,38 @@ exit "$TOOL_RC"
             self.assertLessEqual(len(fields["description"]), 140)
             statuses.append(fields)
         return result, statuses
+
+    def run_missing(self, gh_body):
+        stubs = self.work / "missing-stubs"
+        executable(stubs / "gh", gh_body)
+        output = self.work / "missing-output"
+        output.write_text("")
+        result = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c",
+             step(WORKFLOW, "Find the gate statuses this head lacks")],
+            cwd=self.work, capture_output=True, text=True, timeout=10,
+            env={**self.env, "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
+                 "GITHUB_OUTPUT": str(output)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return output.read_text(), result.stdout
+
+    def test_a_comment_run_runs_the_gates_only_when_a_status_is_missing(self):
+        everything = "".join(f"checks / {name}\\n" for name in STATUS_GATES.values())
+        cases = {
+            "all five present": (f"printf '{everything}'", "run=false\n"),
+            "one missing": (f"printf '{everything}' | grep -v 'No credentials'", "run=true\n"),
+            "none": ("true", "run=true\n"),
+            "read fails": ("exit 1", "run=true\n"),
+        }
+        for case, (body, expected) in cases.items():
+            with self.subTest(case=case):
+                output, stdout = self.run_missing(body + "\n")
+                self.assertEqual(output, expected)
+                if case == "read fails":
+                    self.assertIn("::warning::could not read the statuses", stdout)
+        # Only github-actions[bot] statuses of this head count.
+        output, _ = self.run_missing('case "$*" in *"github-actions[bot]"*"/commits/' + "a" * 40 + '/statuses"*|*"/commits/' + "a" * 40 + '/statuses"*"github-actions[bot]"*) printf \'' + everything + '\' ;; esac\n')
+        self.assertEqual(output, "run=false\n")
 
     def test_each_step_publishes_its_exit_result_and_fails_the_summary(self):
         for gate, rc in product(STATUS_GATES, (0, 1, 2, 17)):

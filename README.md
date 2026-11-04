@@ -10,7 +10,7 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
 
 | File | What it does |
 |---|---|
-| `.github/workflows/checks.yml` | One job per event (ai-sdlc #483) resolves the head, fetches the signed record and bundle once, verifies and unpacks the saved pair once, and checks out once. On PR events it runs review-on-head, then owner-decisions, locked-tests, secret-scan (including written-by), manifest and Cloudflare-cost in order. A review comment runs only review-on-head. The job removes its temporary bundle. The gates prefer `bin/<os>-<arch>/aisdlc gate <name>` from that bundle. No gate reads the caller's `.ai-sdlc/`. |
+| `.github/workflows/checks.yml` | One job per event (ai-sdlc #483) resolves the head, fetches the signed record and bundle once, verifies and unpacks the saved pair once, and checks out once. On PR events it runs review-on-head, then owner-decisions, locked-tests, secret-scan (including written-by), manifest and Cloudflare-cost in order. A review comment runs review-on-head, plus any of the other five gates whose status the head lacks. The job removes its temporary bundle. The gates prefer `bin/<os>-<arch>/aisdlc gate <name>` from that bundle. No gate reads the caller's `.ai-sdlc/`. |
 | `.github/workflows/security.yml` | The weekly security scan. Runs the signed bundle's `aisdlc gate security-intake`. |
 | `.github/workflows/nightly-gates.yml` | The manual nightly lessons audit on the Mac runner. The prompt and the `claude-api`, `bookmark` and `nightly-status` gates come from the signed bundle; the caller cannot supply the command. |
 | `.github/workflows/bot-review.yml` | The App's formal review of each open PR head, from the bundle's `aisdlc gate bot-review`. |
@@ -24,7 +24,7 @@ Each of the four gate workflows has one shared `select_gate` shell function. It 
 
 Locked-tests runs the verified bundle binary, when available, against the pinned PR target and head. Its fallback still copies the bundle's Python helper to `$RUNNER_TEMP` before running it; PR code supplies neither helper. The written-by exit/output contract and the owner's warning-only treatment of an unknown author are unchanged.
 
-The `checks` job, named `AI-SDLC gates`, publishes five commit statuses with the caller's former check-run contexts:
+The `checks` job keeps the review job's former check-run name, `Independent APPROVE names the head`. ai-sdlc's head checks skip that name, so a run that a review-comment run replaced leaves no cancelled check that holds the merge; the results are held by the statuses instead. It publishes five commit statuses with the caller's former check-run contexts:
 
 - `checks / owner-decisions.md is append-only`
 - `checks / A fix leaves its failing test alone`
