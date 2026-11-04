@@ -45,9 +45,7 @@ class ChecksWorkflow(unittest.TestCase):
         # ai-sdlc #483: one runner job per event; review runs first, then the five gates.
         self.assertEqual(list(JOBS), ["checks"])
         job = JOBS["checks"]
-        # The review job's former check-run name, which ai-sdlc's head checks skip, so a replaced
-        # queued run leaves no cancelled check that holds the merge (codex review of 2be1f64).
-        self.assertIn("    name: Independent APPROVE names the head\n", job)
+        self.assertIn("    name: AI-SDLC gates\n", job)
         self.assertNotIn("needs:", job)
         self.assertEqual(job.count("uses: actions/checkout@"), 1)
         contexts = re.findall(r"^          STATUS_CONTEXT: (.*)$", job, re.M)
@@ -59,34 +57,23 @@ class ChecksWorkflow(unittest.TestCase):
         self.assertNotIn("STATUS_CONTEXT", review)
         self.assertNotIn('eval "$GATE_STATUS"', review)
 
-    def test_comment_runs_share_the_per_pr_lock_and_fill_missing_gates(self):
+    def test_comment_runs_cannot_replace_pr_event_runs(self):
         header = JOBS["checks"].split("    steps:\n", 1)[0]
         self.assertIn("    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)\n", header)
         self.assertIn("    concurrency:\n", header)
-        # One group per PR for every event, never cancelled: review reads and status writes
-        # stay serialised (codex P1 on #17).
-        self.assertIn("      group: ai-sdlc-checks-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}\n", header)
-        self.assertNotIn("'review' || 'gates'", header)
+        # Per PR and per event kind: a comment run never replaces a pending PR-event run.
+        self.assertIn("      group: ai-sdlc-checks-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{ github.event_name == 'issue_comment' && 'review' || 'gates' }}\n", header)
         self.assertIn("      cancel-in-progress: false\n", header)
         caller = (ROOT / ".github/workflows/ai-sdlc-checks.yml").read_text()
         self.assertIn("\nconcurrency:\n", caller)
-        # A comment run that replaced a pending PR-event run runs any gate the head lacks.
-        missing = JOBS["checks"].split("      - name: Find the gate statuses this head lacks\n", 1)[1].split("\n      - name:", 1)[0]
-        self.assertIn("if: always() && steps.pr.outputs.is_pr == 'true' && github.event_name == 'issue_comment'\n", missing)
-        self.assertIn("select(.creator.login == \"github-actions[bot]\")", missing)
-        for name in GATES.values():
-            if name != GATES["review-on-head"]:
-                self.assertIn(f"checks / {name}", missing)
-        self.assertIn("run=true", missing)
 
-    def test_a_review_comment_runs_the_review_gate_and_only_missing_gates(self):
+    def test_a_review_comment_runs_only_the_review_gate(self):
         for gate, name in GATES.items():
             block = gate_block(name)
             if gate == "review-on-head":
                 self.assertNotIn("github.event_name != 'issue_comment'", block)
-                self.assertNotIn("steps.missing", block)
             else:
-                self.assertIn("(github.event_name != 'issue_comment' || steps.missing.outputs.run == 'true')", block)
+                self.assertIn("github.event_name != 'issue_comment'", block)
 
     def test_every_gate_has_a_ten_minute_timeout_with_job_setup_allowance(self):
         for name in GATES.values():
@@ -99,7 +86,7 @@ class ChecksWorkflow(unittest.TestCase):
             block = gate_block(name)
             condition = "if: always() && steps.pr.outputs.is_pr == 'true'"
             if gate != "review-on-head":
-                condition += " && (github.event_name != 'issue_comment' || steps.missing.outputs.run == 'true')"
+                condition += " && github.event_name != 'issue_comment'"
             self.assertIn(condition + "\n", block)
             # All gates run after earlier failures; review alone keeps the old status contract.
             self.assertNotIn("continue-on-error:", block)
@@ -321,38 +308,6 @@ exit "$TOOL_RC"
             statuses.append(fields)
         return result, statuses
 
-    def run_missing(self, gh_body):
-        stubs = self.work / "missing-stubs"
-        executable(stubs / "gh", gh_body)
-        output = self.work / "missing-output"
-        output.write_text("")
-        result = subprocess.run(
-            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c",
-             step(WORKFLOW, "Find the gate statuses this head lacks")],
-            cwd=self.work, capture_output=True, text=True, timeout=10,
-            env={**self.env, "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
-                 "GITHUB_OUTPUT": str(output)})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return output.read_text(), result.stdout
-
-    def test_a_comment_run_runs_the_gates_only_when_a_status_is_missing(self):
-        everything = "".join(f"checks / {name}\\n" for name in STATUS_GATES.values())
-        cases = {
-            "all five present": (f"printf '{everything}'", "run=false\n"),
-            "one missing": (f"printf '{everything}' | grep -v 'No credentials'", "run=true\n"),
-            "none": ("true", "run=true\n"),
-            "read fails": ("exit 1", "run=true\n"),
-        }
-        for case, (body, expected) in cases.items():
-            with self.subTest(case=case):
-                output, stdout = self.run_missing(body + "\n")
-                self.assertEqual(output, expected)
-                if case == "read fails":
-                    self.assertIn("::warning::could not read the statuses", stdout)
-        # Only github-actions[bot] statuses of this head count.
-        output, _ = self.run_missing('case "$*" in *"github-actions[bot]"*"/commits/' + "a" * 40 + '/statuses"*|*"/commits/' + "a" * 40 + '/statuses"*"github-actions[bot]"*) printf \'' + everything + '\' ;; esac\n')
-        self.assertEqual(output, "run=false\n")
-
     def test_each_step_publishes_its_exit_result_and_fails_the_summary(self):
         for gate, rc in product(STATUS_GATES, (0, 1, 2, 17)):
             with self.subTest(gate=gate, rc=rc):
@@ -370,6 +325,29 @@ exit "$TOOL_RC"
                 self.assertEqual(len(statuses), 1)
                 self.assertEqual(statuses[0]["context"], "ai-sdlc/review-on-head")
                 self.assertEqual(statuses[0]["state"], {0: "success", 1: "failure"}.get(rc, "error"))
+
+    def test_review_rewrites_its_status_until_a_fresh_read_agrees(self):
+        # PR-event and comment runs use separate concurrency groups, so another run can write
+        # ai-sdlc/review-on-head between this run's read and write (codex review of e3f61e3).
+        tool = self.work / "ai-sdlc-gates/bin/linux-amd64/aisdlc"
+        executable(tool, '''if [ "$#" -eq 1 ] && [ "$1" = gate ]; then
+  echo 'usage: aisdlc gate <name> [args]'; exit 2
+fi
+n=$(($(cat "$RUNNER_TEMP/reads" 2>/dev/null || echo 0) + 1)); echo "$n" > "$RUNNER_TEMP/reads"
+set -- $READS; shift $((n > $# ? $# - 1 : n - 1)); case "$1" in
+  approve) echo "REVIEW-ON-HEAD OK: approved"; exit 0 ;;
+  wait) echo "REVIEW-ON-HEAD FAIL: no review names this head"; exit 1 ;;
+esac
+''')
+        for reads, states, rc in (("approve", ["success"], 0),
+                                  ("wait approve", ["pending", "success"], 0),
+                                  ("approve wait", ["success", "pending"], 0),
+                                  ("wait approve wait approve wait approve", ["pending", "success", "pending", "success", "pending"], 2)):
+            with self.subTest(reads=reads):
+                (self.work / "reads").unlink(missing_ok=True)
+                result, statuses = self.run_gate("review-on-head", READS=reads)
+                self.assertEqual(result.returncode, rc, result.stdout + result.stderr)
+                self.assertEqual([status["state"] for status in statuses], states)
 
     def test_failed_fetch_unpack_or_checkout_fails_all_steps_closed_even_with_stale_tools(self):
         # False readiness also covers a fetch failure followed by a skipped unpack. Tools
