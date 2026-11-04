@@ -57,23 +57,34 @@ class ChecksWorkflow(unittest.TestCase):
         self.assertNotIn("STATUS_CONTEXT", review)
         self.assertNotIn('eval "$GATE_STATUS"', review)
 
-    def test_comment_runs_cannot_replace_pr_event_runs(self):
+    def test_comment_runs_share_the_per_pr_lock_and_fill_missing_gates(self):
         header = JOBS["checks"].split("    steps:\n", 1)[0]
         self.assertIn("    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)\n", header)
         self.assertIn("    concurrency:\n", header)
-        # Per PR and per event kind: a comment run never replaces a pending PR-event run.
-        self.assertIn("      group: ai-sdlc-checks-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{ github.event_name == 'issue_comment' && 'review' || 'gates' }}\n", header)
+        # One group per PR for every event, never cancelled: review reads and status writes
+        # stay serialised (codex P1 on #17).
+        self.assertIn("      group: ai-sdlc-checks-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}\n", header)
+        self.assertNotIn("'review' || 'gates'", header)
         self.assertIn("      cancel-in-progress: false\n", header)
         caller = (ROOT / ".github/workflows/ai-sdlc-checks.yml").read_text()
         self.assertIn("\nconcurrency:\n", caller)
+        # A comment run that replaced a pending PR-event run runs any gate the head lacks.
+        missing = JOBS["checks"].split("      - name: Find the gate statuses this head lacks\n", 1)[1].split("\n      - name:", 1)[0]
+        self.assertIn("if: always() && steps.pr.outputs.is_pr == 'true' && github.event_name == 'issue_comment'\n", missing)
+        self.assertIn("select(.creator.login == \"github-actions[bot]\")", missing)
+        for name in GATES.values():
+            if name != GATES["review-on-head"]:
+                self.assertIn(f"checks / {name}", missing)
+        self.assertIn("run=true", missing)
 
-    def test_a_review_comment_runs_only_the_review_gate(self):
+    def test_a_review_comment_runs_the_review_gate_and_only_missing_gates(self):
         for gate, name in GATES.items():
             block = gate_block(name)
             if gate == "review-on-head":
                 self.assertNotIn("github.event_name != 'issue_comment'", block)
+                self.assertNotIn("steps.missing", block)
             else:
-                self.assertIn("github.event_name != 'issue_comment'", block)
+                self.assertIn("(github.event_name != 'issue_comment' || steps.missing.outputs.run == 'true')", block)
 
     def test_every_gate_has_a_ten_minute_timeout_with_job_setup_allowance(self):
         for name in GATES.values():
@@ -86,7 +97,7 @@ class ChecksWorkflow(unittest.TestCase):
             block = gate_block(name)
             condition = "if: always() && steps.pr.outputs.is_pr == 'true'"
             if gate != "review-on-head":
-                condition += " && github.event_name != 'issue_comment'"
+                condition += " && (github.event_name != 'issue_comment' || steps.missing.outputs.run == 'true')"
             self.assertIn(condition + "\n", block)
             # All gates run after earlier failures; review alone keeps the old status contract.
             self.assertNotIn("continue-on-error:", block)

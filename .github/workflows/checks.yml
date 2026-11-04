@@ -6,8 +6,8 @@
 #   uses: eugnel-ltd/ai-sdlc-loader/.github/workflows/checks.yml@<40-hex sha>  (the canary only)
 # One job per event resolves the PR, fetches and verifies the signed bundle once and checks out
 # once. On PR events it runs the review gate and then the five other gates, and each publishes
-# its former check-run name as a commit status. A review comment runs only the review gate,
-# which keeps its legacy `ai-sdlc/review-on-head` status semantics.
+# its former check-run name as a commit status. A review comment runs the review gate, which
+# keeps its legacy `ai-sdlc/review-on-head` status semantics, plus any gate whose status the head lacks.
 # No gate reads the caller's `.ai-sdlc/` or runs PR code.
 # Public repos use GitHub-hosted Ubuntu; private repos use the small self-hosted runner.
 # The caller's runs_on input is accepted and ignored.
@@ -94,11 +94,12 @@ jobs:
     runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
     # Ten minutes for setup and cleanup, plus six sequential ten-minute gate limits.
     timeout-minutes: 70
-    # One group per PR and event kind, never cancelled. A review-comment run queues only behind
-    # other comment runs and a PR-event run only behind PR-event runs, so neither can replace a
-    # pending run of the other kind and drop its statuses.
+    # One group per PR, never cancelled, so every ai-sdlc/review-on-head read and write is
+    # serialised across PR events and review comments. GitHub keeps one pending run per group and
+    # a newer one replaces it; a comment run therefore also runs any of the five gates whose status
+    # the current head lacks (step "Find the gate statuses this head lacks"), so no status is lost.
     concurrency:
-      group: ai-sdlc-checks-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{ github.event_name == 'issue_comment' && 'review' || 'gates' }}
+      group: ai-sdlc-checks-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: false
     steps:
       - name: Resolve the PR
@@ -201,6 +202,32 @@ jobs:
         if: always() && steps.pr.outputs.is_pr == 'true'
         with:
           fetch-depth: 0
+      # A comment run may have replaced a pending PR-event run of this head (one pending run per
+      # group). It runs the five gates when any of their statuses is missing on the head, and when
+      # the statuses cannot be read.
+      - name: Find the gate statuses this head lacks
+        id: missing
+        if: always() && steps.pr.outputs.is_pr == 'true' && github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD: ${{ steps.pr.outputs.head }}
+        run: |
+          set -u
+          if have=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$HEAD/statuses?per_page=100" \
+               --jq '.[] | select(.creator.login == "github-actions[bot]") | .context'); then
+            run=false
+            for context in "checks / owner-decisions.md is append-only" \
+                "checks / A fix leaves its failing test alone" "checks / No credentials in the PR range" \
+                "checks / product.yaml is valid and a published product has its baseline" \
+                'checks / Cloudflare config stays inside the US$5 plan'; do
+              printf '%s\n' "$have" | grep -Fqx -- "$context" || run=true
+            done
+          else
+            echo "::warning::could not read the statuses of $HEAD; running every gate"
+            run=true
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "gates run on this comment event: $run"
       - name: Independent APPROVE names the head
         id: review-on-head
         timeout-minutes: 10
@@ -256,7 +283,7 @@ jobs:
       - name: owner-decisions.md is append-only
         id: owner-decisions
         timeout-minutes: 10
-        if: always() && steps.pr.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+        if: always() && steps.pr.outputs.is_pr == 'true' && (github.event_name != 'issue_comment' || steps.missing.outputs.run == 'true')
         env:
           STATUS_CONTEXT: checks / owner-decisions.md is append-only
           GH_TOKEN: ${{ github.token }}
@@ -280,7 +307,7 @@ jobs:
       - name: A fix leaves its failing test alone
         id: locked-tests
         timeout-minutes: 10
-        if: always() && steps.pr.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+        if: always() && steps.pr.outputs.is_pr == 'true' && (github.event_name != 'issue_comment' || steps.missing.outputs.run == 'true')
         env:
           STATUS_CONTEXT: checks / A fix leaves its failing test alone
           GH_TOKEN: ${{ github.token }}
@@ -389,7 +416,7 @@ jobs:
       - name: No credentials in the PR range
         id: secret-scan
         timeout-minutes: 10
-        if: always() && steps.pr.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+        if: always() && steps.pr.outputs.is_pr == 'true' && (github.event_name != 'issue_comment' || steps.missing.outputs.run == 'true')
         env:
           STATUS_CONTEXT: checks / No credentials in the PR range
           GH_TOKEN: ${{ github.token }}
@@ -400,7 +427,8 @@ jobs:
           BASE: ${{ inputs.base }}
           PR: ${{ steps.pr.outputs.number }}
           LOADER_SHA: ${{ steps.gates.outputs.loader_sha }}
-          BODY: ${{ github.event.pull_request.body }}
+          # A PR comment event carries the PR body as the issue body.
+          BODY: ${{ github.event.pull_request.body || github.event.issue.body }}
         run: |
           eval "$GATE_STATUS"
           [ "$BUNDLE_READY" = true ] && [ "$CHECKOUT_READY" = true ] \
@@ -455,7 +483,7 @@ jobs:
       - name: product.yaml is valid and a published product has its baseline
         id: manifest
         timeout-minutes: 10
-        if: always() && steps.pr.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+        if: always() && steps.pr.outputs.is_pr == 'true' && (github.event_name != 'issue_comment' || steps.missing.outputs.run == 'true')
         env:
           STATUS_CONTEXT: checks / product.yaml is valid and a published product has its baseline
           GH_TOKEN: ${{ github.token }}
@@ -490,7 +518,7 @@ jobs:
       - name: Cloudflare config stays inside the US$5 plan
         id: cloudflare-cost
         timeout-minutes: 10
-        if: always() && steps.pr.outputs.is_pr == 'true' && github.event_name != 'issue_comment'
+        if: always() && steps.pr.outputs.is_pr == 'true' && (github.event_name != 'issue_comment' || steps.missing.outputs.run == 'true')
         env:
           STATUS_CONTEXT: checks / Cloudflare config stays inside the US$5 plan
           GH_TOKEN: ${{ github.token }}
