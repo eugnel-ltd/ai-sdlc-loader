@@ -41,38 +41,45 @@ def status_publisher():
 
 
 class ChecksWorkflow(unittest.TestCase):
-    def test_two_independent_jobs_and_five_exact_status_contexts(self):
-        self.assertEqual(list(JOBS), ["review-on-head", "checks"])
-        self.assertIn("    name: Independent APPROVE names the head\n", JOBS["review-on-head"])
-        self.assertIn("    name: AI-SDLC gates\n", JOBS["checks"])
-        for job in JOBS.values():
-            self.assertNotIn("needs:", job)
-            self.assertEqual(job.count("uses: actions/checkout@"), 1)
-        contexts = re.findall(r"^          STATUS_CONTEXT: (.*)$", JOBS["checks"], re.M)
+    def test_one_job_and_five_exact_status_contexts(self):
+        # ai-sdlc #483: one runner job per event; review runs first, then the five gates.
+        self.assertEqual(list(JOBS), ["checks"])
+        job = JOBS["checks"]
+        self.assertIn("    name: AI-SDLC gates\n", job)
+        self.assertNotIn("needs:", job)
+        self.assertEqual(job.count("uses: actions/checkout@"), 1)
+        contexts = re.findall(r"^          STATUS_CONTEXT: (.*)$", job, re.M)
         self.assertEqual(contexts, ["checks / " + name for name in STATUS_GATES.values()])
-        review = JOBS["review-on-head"]
+        names = re.findall(r"^      - name: (.*)$", job, re.M)
+        self.assertEqual([n for n in names if n in GATES.values()], list(GATES.values()))
+        review = gate_block(GATES["review-on-head"])
         self.assertIn("context=ai-sdlc/review-on-head", review)
         self.assertNotIn("STATUS_CONTEXT", review)
         self.assertNotIn('eval "$GATE_STATUS"', review)
 
-    def test_comment_runs_cannot_replace_pr_gate_jobs(self):
-        review = JOBS["review-on-head"].split("    steps:\n", 1)[0]
-        self.assertIn("    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)\n", review)
-        self.assertIn("    concurrency:\n", review)
-        self.assertIn("      group: ai-sdlc-review-on-head-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}\n", review)
-        self.assertIn("      cancel-in-progress: false\n", review)
-        checks = JOBS["checks"].split("    steps:\n", 1)[0]
-        self.assertIn("    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'\n", checks)
-        self.assertNotIn("    concurrency:", checks)
+    def test_comment_runs_cannot_replace_pr_event_runs(self):
+        header = JOBS["checks"].split("    steps:\n", 1)[0]
+        self.assertIn("    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)\n", header)
+        self.assertIn("    concurrency:\n", header)
+        # Per PR and per event kind: a comment run never replaces a pending PR-event run.
+        self.assertIn("      group: ai-sdlc-checks-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{ github.event_name == 'issue_comment' && 'review' || 'gates' }}\n", header)
+        self.assertIn("      cancel-in-progress: false\n", header)
         caller = (ROOT / ".github/workflows/ai-sdlc-checks.yml").read_text()
         self.assertIn("\nconcurrency:\n", caller)
+
+    def test_a_review_comment_runs_only_the_review_gate(self):
+        for gate, name in GATES.items():
+            block = gate_block(name)
+            if gate == "review-on-head":
+                self.assertNotIn("github.event_name != 'issue_comment'", block)
+            else:
+                self.assertIn("github.event_name != 'issue_comment'", block)
 
     def test_every_gate_has_a_ten_minute_timeout_with_job_setup_allowance(self):
         for name in GATES.values():
             self.assertIn("        timeout-minutes: 10\n", gate_block(name))
-        for job, gates in (("review-on-head", 1), ("checks", 5)):
-            timeout = int(re.search(r"^    timeout-minutes: (\d+)$", JOBS[job], re.M)[1])
-            self.assertGreaterEqual(timeout, gates * 10 + 10)
+        timeout = int(re.search(r"^    timeout-minutes: (\d+)$", JOBS["checks"], re.M)[1])
+        self.assertGreaterEqual(timeout, len(GATES) * 10 + 10)
 
     def test_gates_continue_after_failure_and_keep_event_guards(self):
         for gate, name in GATES.items():
@@ -116,10 +123,7 @@ class ChecksWorkflow(unittest.TestCase):
         for block in WORKFLOW.split("\n    permissions:\n")[1:]:
             self.assertIn("      id-token: write", block.split("\n    steps:")[0])
 
-    def test_identical_inline_setup_and_one_broker_fetch_per_job(self):
-        setups = [job.split("    steps:\n", 1)[1].split("      - name: Independent APPROVE", 1)[0]
-                  .split("      - name: owner-decisions", 1)[0] for job in JOBS.values()]
-        self.assertEqual(setups[0], setups[1])
+    def test_one_inline_setup_and_one_broker_fetch(self):
         for job in JOBS.values():
             self.assertEqual(job.count('fetch_gates.py" fetch '), 1)
             self.assertEqual(job.count('fetch_gates.py" unpack '), 1)
@@ -396,7 +400,7 @@ class GateRunners(unittest.TestCase):
             text = (ROOT / ".github/workflows" / name).read_text()
             self.assertNotIn('"self-hosted", "linux"', text, name)
         checks = (ROOT / ".github/workflows/checks.yml").read_text()
-        self.assertEqual(checks.count("""fromJSON('["self-hosted", "small"]')"""), 2)
+        self.assertEqual(checks.count("""fromJSON('["self-hosted", "small"]')"""), 1)
 
 
 class SecurityAndNightly(unittest.TestCase):

@@ -4,9 +4,10 @@
 # `.github/workflows/ai-sdlc-checks.yml` on main, with `permissions: id-token: write`:
 #   uses: eugnel-ltd/ai-sdlc-loader/.github/workflows/checks.yml@v3            (adopters, slice 6)
 #   uses: eugnel-ltd/ai-sdlc-loader/.github/workflows/checks.yml@<40-hex sha>  (the canary only)
-# Two independent jobs resolve the PR and each fetch and verify the signed bundle once.
-# Review keeps its check-run name and legacy status semantics. The five other gates run
-# sequentially on PR events and publish their former check-run names as commit statuses.
+# One job per event resolves the PR, fetches and verifies the signed bundle once and checks out
+# once. On PR events it runs the review gate and then the five other gates, and each publishes
+# its former check-run name as a commit status. A review comment runs only the review gate,
+# which keeps its legacy `ai-sdlc/review-on-head` status semantics.
 # No gate reads the caller's `.ai-sdlc/` or runs PR code.
 # Public repos use GitHub-hosted Ubuntu; private repos use the small self-hosted runner.
 # The caller's runs_on input is accepted and ignored.
@@ -87,15 +88,17 @@ env:
     }
 
 jobs:
-  review-on-head:
-    name: Independent APPROVE names the head
+  checks:
+    name: AI-SDLC gates
     if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target' || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
     runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
-    # Ten minutes for setup and cleanup, plus the review gate's ten-minute limit.
-    timeout-minutes: 20
-    # Only review writes are serialised per PR. Comment runs never queue the five gates.
+    # Ten minutes for setup and cleanup, plus six sequential ten-minute gate limits.
+    timeout-minutes: 70
+    # One group per PR and event kind, never cancelled. A review-comment run queues only behind
+    # other comment runs and a PR-event run only behind PR-event runs, so neither can replace a
+    # pending run of the other kind and drop its statuses.
     concurrency:
-      group: ai-sdlc-review-on-head-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      group: ai-sdlc-checks-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}-${{ github.event_name == 'issue_comment' && 'review' || 'gates' }}
       cancel-in-progress: false
     steps:
       - name: Resolve the PR
@@ -250,122 +253,6 @@ jobs:
             echo "::error::could not write the status ai-sdlc/review-on-head on $HEAD"; [ "$code" -ne 0 ] || code=2
           fi
           exit "$code"
-      - name: Clean up the gate bundle and temporary inputs
-        if: always()
-        run: |
-          rm -rf "$RUNNER_TEMP/ai-sdlc-fetch" "$RUNNER_TEMP/ai-sdlc-gates" \
-            "$RUNNER_TEMP/ai-sdlc-loader" "$RUNNER_TEMP/ai-sdlc-verifier"
-          rm -f "$RUNNER_TEMP/locked_tests_check.py" "$RUNNER_TEMP/pr-body.txt" \
-            "$RUNNER_TEMP/pr-files.txt" "$RUNNER_TEMP/product.yaml" "$RUNNER_TEMP/owner-decisions.md"
-
-  checks:
-    name: AI-SDLC gates
-    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
-    runs-on: ${{ github.event.repository.visibility == 'public' && fromJSON('["ubuntu-24.04"]') || fromJSON('["self-hosted", "small"]') }}
-    # Ten minutes for setup and cleanup, plus five sequential ten-minute gate limits.
-    timeout-minutes: 60
-    # The caller's workflow-level concurrency still applies; no job-level group here.
-    steps:
-      - name: Resolve the PR
-        id: pr
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          IS_ISSUE_PR: ${{ github.event.issue.pull_request != null }}
-        run: |
-          set -eu
-          command -v gh >/dev/null || { echo "::error::gh is not installed on this runner"; exit 2; }
-          resolve_error() { echo "::error::$*"; exit 2; }
-          full_sha() {
-            case "$1" in *[!0-9a-f]*|"") return 1 ;; esac
-            [ ${#1} -eq 40 ]
-          }
-          if [ "$EVENT" = pull_request ] || [ "$EVENT" = pull_request_target ]; then
-            requested=$PR_NUMBER
-          elif [ "$EVENT" = issue_comment ] && [ "$IS_ISSUE_PR" = true ]; then
-            requested=$ISSUE_NUMBER
-          else
-            echo "is_pr=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          case "$requested" in ''|*[!0-9]*) resolve_error "Invalid PR number" ;; esac
-          # One authenticated snapshot binds the head and actual target together. The
-          # configured helper branch remains independent of these product data refs.
-          snapshot=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$requested" \
-            --jq '[.number,.head.sha,.head.ref,.base.sha,.base.ref,.base.repo.full_name]|@tsv') \
-            || resolve_error "Could not resolve the current PR"
-          case "$snapshot" in *$'\n'*|*$'\r'*) resolve_error "Invalid PR metadata row" ;; esac
-          IFS=$'\t' read -r number head branch target_base_sha target_base_ref base_repo surplus <<EOF
-          $snapshot
-          EOF
-          [ "$number" = "$requested" ] && [ -z "$surplus" ] || resolve_error "PR identity mismatch"
-          full_sha "$head" && full_sha "$target_base_sha" || resolve_error "Invalid PR commit identity"
-          git check-ref-format "refs/heads/$branch" >/dev/null 2>&1 \
-            && git check-ref-format "refs/heads/$target_base_ref" >/dev/null 2>&1 \
-            || resolve_error "Invalid PR branch identity"
-          [ "$base_repo" = "$GITHUB_REPOSITORY" ] || resolve_error "PR target repository mismatch"
-          if [ "$EVENT" != issue_comment ]; then
-            [ "$head" = "$PR_HEAD" ] && [ "$branch" = "$PR_BRANCH" ] \
-              && [ "$target_base_ref" = "$PR_BASE_REF" ] && [ "$base_repo" = "$PR_BASE_REPO" ] \
-              || resolve_error "PR changed head or target since this event"
-          fi
-          echo "number=$number" >> "$GITHUB_OUTPUT"
-          echo "head=$head" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "target_base_sha=$target_base_sha" >> "$GITHUB_OUTPUT"
-          echo "target_base_ref=$target_base_ref" >> "$GITHUB_OUTPUT"
-          echo "is_pr=true" >> "$GITHUB_OUTPUT"
-      # This job's one broker fetch uses this loader commit's fetcher and pinned verifier.
-      # Every gate checks the fetch and unpack outcomes, including gates that would skip.
-      - name: Fetch the signed gate bundle for this run
-        id: gates
-        if: steps.pr.outputs.is_pr == 'true'
-        continue-on-error: true
-        run: |
-          set -eu
-          loader=$RUNNER_TEMP/ai-sdlc-loader
-          rm -rf "$loader" "$RUNNER_TEMP/ai-sdlc-fetch" "$RUNNER_TEMP/ai-sdlc-verifier" "$RUNNER_TEMP/ai-sdlc-gates"
-          loader_sha=$(python3 -I - <<'NAME_LOADER'
-          import base64, json, os, re, sys, urllib.request
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
-          url += ("&" if "?" in url else "?") + "audience=ai-sdlc-gates"
-          request = urllib.request.Request(url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-          token = json.load(urllib.request.urlopen(request, timeout=10))["value"]
-          part = token.split(".")[1]
-          sha = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("job_workflow_sha", "")
-          if not re.fullmatch(r"[0-9a-f]{40}", sha):
-              sys.exit("the OIDC token names no loader commit")
-          print(sha)
-          NAME_LOADER
-          )
-          echo "loader_sha=$loader_sha" >> "$GITHUB_OUTPUT"
-          git init -q "$loader"
-          git -C "$loader" fetch -q --depth=1 https://github.com/eugnel-ltd/ai-sdlc-loader.git "$loader_sha"
-          git -C "$loader" checkout -q --detach FETCH_HEAD
-          sh "$loader/verifier/fetch_cosign.sh" "$RUNNER_TEMP/ai-sdlc-verifier"
-          python3 -I "$loader/fetch_gates.py" fetch --verifier "$RUNNER_TEMP/ai-sdlc-verifier" --out "$RUNNER_TEMP/ai-sdlc-fetch"
-      - name: Verify and unpack the signed gate bundle
-        id: bundle
-        if: steps.pr.outputs.is_pr == 'true' && steps.gates.outcome == 'success'
-        env:
-          LOADER_SHA: ${{ steps.gates.outputs.loader_sha }}
-        run: |
-          set -eu
-          # Reuse the fetched loader and pinned verifier; no extra download or broker fetch.
-          python3 -I "$RUNNER_TEMP/ai-sdlc-loader/fetch_gates.py" unpack \
-            --verifier "$RUNNER_TEMP/ai-sdlc-verifier" --saved "$RUNNER_TEMP/ai-sdlc-fetch" \
-            --loader-sha "$LOADER_SHA" --out "$RUNNER_TEMP/ai-sdlc-gates"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        id: checkout
-        if: always() && steps.pr.outputs.is_pr == 'true'
-        with:
-          fetch-depth: 0
       - name: owner-decisions.md is append-only
         id: owner-decisions
         timeout-minutes: 10
